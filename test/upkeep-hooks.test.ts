@@ -87,7 +87,7 @@ test('session-start surfaces a cached upgrade nudge', async () => {
   const repo = wiredRepo('hook-nudge');
   const ctx = contextOf(await runHook('session-start', repo, homeWithCache('hook-nudge-home', '99.0.0')));
   assert.match(ctx, /graft .* → 99\.0\.0 available/);
-  assert.match(ctx, /npm i -g @nanonets\/graft@latest/);
+  assert.match(ctx, /run `graft upgrade`/);
 });
 
 test('an up-to-date install gets no nudge', async () => {

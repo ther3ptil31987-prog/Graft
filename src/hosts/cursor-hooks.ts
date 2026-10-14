@@ -25,7 +25,6 @@
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hooksShim } from '../claude/shim-template.js';
-import { claudeDistDir } from '../claude/paths.js';
 import type { PlannedWrite } from './plan.js';
 import { writeOwned, isGraftEntry, readJsonObject, type ConfigWrite } from './config-write.js';
 
@@ -83,7 +82,7 @@ function desiredEntries(): DesiredEntry[] {
  */
 export function installCursorHooks(repo: string): ConfigWrite[] {
   const shimPath = shimPathFor(repo);
-  const shimWrite = writeOwned('cursor-hook-shim', shimPath, hooksShim(claudeDistDir()), 0o755);
+  const shimWrite = writeOwned('cursor-hook-shim', shimPath, hooksShim(), 0o755);
   const cfgPath = configPathFor(repo);
   const skipped: ConfigWrite = { id: 'cursor-hooks', path: cfgPath, action: 'skipped-unparseable' };
 

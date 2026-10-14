@@ -17,7 +17,7 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { relPosix } from "../util/paths.js";
-import matter from "gray-matter";
+import { matter } from "../util/front-matter.js";
 import type { GraphV1, NodeV1 } from "./types.js";
 import { CACHE_DIR, readNodes } from "../context/node-file.js";
 import { GRAPH_DIR } from "./write.js";

@@ -13,6 +13,7 @@ import { installCodexHooks } from './codex-hooks.js';
 import { installCursorHooks } from './cursor-hooks.js';
 import type { ConfigWrite } from './config-write.js';
 import { installAntigravitySkill } from './antigravity.js';
+import { rememberInstall } from '../claude/shim-template.js';
 
 export interface HostsInitResult {
   written: { id: string; path: string; action: string }[];
@@ -89,6 +90,8 @@ export function runHostsInit(
     opts.hooks === false || !selected.some((h) => h.id === 'cursor')
       ? []
       : installCursorHooks(repo);
+  // Both write the hooks shim, which finds this install through the trail home.
+  if (hooks.length > 0 || cursorHooks.length > 0) rememberInstall(home);
   // Antigravity's skill is a global write too, so --no-global suppresses it as well.
   const antigravitySkill =
     opts.global === false || !selected.some((h) => h.id === 'antigravity')
