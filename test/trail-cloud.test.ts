@@ -10,14 +10,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRAND_ENV } from "../src/brand.js";
 import { formatOverlap, overlapsWith, refreshBranches } from "../src/notes/branches.js";
 import { listNotes, writeNote } from "../src/notes/notes.js";
 import { flushActivity, learningsPayload, recordActivity, syncRepo } from "../src/cloud/workspace-sync.js";
-import type { Cloud } from "../src/cloud/workspace.js";
+import { clearCloud, writeCloud, type Cloud } from "../src/cloud/workspace.js";
 
 process.env.DO_NOT_TRACK = "1";
 process.env[BRAND_ENV] = "trail";
@@ -161,29 +161,67 @@ test("a repo outside the workspace is never uploaded", async () => {
   assert.equal(sent.length, 0);
 });
 
-test("uses are kept until the machine is connected, then sent once", async () => {
-  const at = new Date().toISOString();
-  recordActivity({ repo: "github.com/acme/retry", kind: "search", asker: "Kumar", session: "s1", query: "retry count", files: ["client.go"], shown_paths: ["a.md"], shown_authors: ["Anirudh"], at });
-  recordActivity({ repo: "github.com/acme/retry", kind: "check", asker: "Kumar", session: "s1", query: "", files: ["client.go"], shown_paths: ["a.md"], shown_authors: ["Anirudh"], at });
-  const outbox = join(process.env.TRAIL_HOME!, "outbox.jsonl");
-  assert.equal(readFileSync(outbox, "utf8").trim().split("\n").length, 2);
+/** One use of the learnings in `repo`, at `at`. */
+function use(repo: string, kind: "search" | "check", at = new Date().toISOString()) {
+  return { repo, kind, asker: "Kumar", session: "s1", query: kind === "search" ? "retry count" : "", files: ["client.go"], shown_paths: ["a.md"], shown_authors: ["Anirudh"], at };
+}
+
+const outbox = () => join(process.env.TRAIL_HOME!, "outbox.jsonl");
+
+test("not connected, a use is never written down: no outbox, cloud features on or off", () => {
+  clearCloud();
+  for (const cloud of [undefined, "1"]) {
+    if (cloud) process.env.TRAIL_CLOUD = cloud;
+    else delete process.env.TRAIL_CLOUD;
+    recordActivity(use("github.com/acme/retry", "search"));
+    recordActivity(use("github.com/acme/retry", "check"));
+  }
+  delete process.env.TRAIL_CLOUD;
+  assert.equal(existsSync(outbox()), false);
+});
+
+test("connected, only the workspace's repos are written down, and sent once", async () => {
   const { cloud, sent, fetchImpl } = cloudFor(["github.com/acme/retry"]);
-  assert.equal(await flushActivity(cloud, fetchImpl), 2);
-  assert.equal(sent[0]!.path, "/api/cli/activity");
-  assert.deepEqual(sent[0]!.body.events.map((e: any) => e.kind), ["search", "check"]);
-  assert.equal(existsSync(outbox), false, "sent, so gone");
-  assert.equal(await flushActivity(cloud, fetchImpl), 0, "nothing twice");
+  cloud.linkedAt = Date.now() - 1000;
+  writeCloud(cloud);
+  try {
+    recordActivity(use("github.com/acme/retry", "search"));
+    recordActivity(use("github.com/acme/other", "search"));
+    recordActivity(use("github.com/acme/retry", "check"));
+    assert.equal(readFileSync(outbox(), "utf8").trim().split("\n").length, 2, "the other repo's search stays on this machine");
+    assert.equal(await flushActivity(cloud, fetchImpl), 2);
+    assert.equal(sent[0]!.path, "/api/cli/activity");
+    assert.deepEqual(sent[0]!.body.events.map((e: any) => [e.repo, e.kind]), [["github.com/acme/retry", "search"], ["github.com/acme/retry", "check"]]);
+    assert.equal(existsSync(outbox()), false, "sent, so gone");
+    assert.equal(await flushActivity(cloud, fetchImpl), 0, "nothing twice");
+  } finally {
+    clearCloud();
+  }
+});
+
+test("what an older trail queued before connecting, or for another repo, is dropped at send, not sent", async () => {
+  const { cloud, sent, fetchImpl } = cloudFor(["github.com/acme/retry"]);
+  cloud.linkedAt = Date.parse("2026-10-10T12:00:00Z");
+  const lines = [
+    use("github.com/acme/retry", "search", "2026-10-10T11:59:59Z"),
+    use("github.com/acme/secret", "search", "2026-10-10T12:30:00Z"),
+    use("github.com/acme/retry", "check", "2026-10-10T12:30:00Z"),
+  ];
+  writeFileSync(outbox(), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  assert.equal(await flushActivity(cloud, fetchImpl), 1);
+  assert.deepEqual(sent[0]!.body.events.map((e: any) => [e.repo, e.kind, e.at]), [["github.com/acme/retry", "check", "2026-10-10T12:30:00Z"]]);
+  assert.equal(existsSync(outbox()), false, "the rest is gone too");
 });
 
 test("a failed send keeps the uses for next time", async () => {
-  recordActivity({ repo: "github.com/acme/retry", kind: "search", asker: "Kumar", session: "s2", query: "q", files: [], shown_paths: ["a.md"], shown_authors: ["Anirudh"], at: new Date().toISOString() });
-  const { cloud } = cloudFor([]);
+  const { cloud } = cloudFor(["github.com/acme/retry"]);
+  recordActivity(use("github.com/acme/retry", "search"), cloud);
   const down = (async () => {
     throw new Error("offline");
   }) as typeof fetch;
   assert.equal(await flushActivity(cloud, down), 0);
-  const outbox = join(process.env.TRAIL_HOME!, "outbox.jsonl");
-  assert.equal(readFileSync(outbox, "utf8").trim().split("\n").length, 1);
+  assert.equal(readFileSync(outbox(), "utf8").trim().split("\n").length, 1);
+  rmSync(outbox(), { force: true });
   mkdirSync(process.env.TRAIL_HOME!, { recursive: true });
 });
 

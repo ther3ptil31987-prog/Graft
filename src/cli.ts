@@ -24,7 +24,7 @@ import { statuslineWanted } from "./claude/settings-merge.js";
 import { runHostsInit } from "./hosts/init.js";
 import { hostIds } from "./hosts/registry.js";
 import { checkoutRoot, ensureRepoHome, keepsNotes, noteCount, rememberRepo, repoName, repoPlace, shownPath } from "./notes/home.js";
-import { brand, cmd, graftNotice, tag } from "./brand.js";
+import { brand, cmd, graftNotice, strandedRepoNotice, tag } from "./brand.js";
 import { branchDiff } from "./cloud/diff.js";
 import { openBrowser } from "./util/browser.js";
 import { contextDirFor } from "./context/node-file.js";
@@ -48,7 +48,8 @@ import { planRetract, runRetract, changed, type Retraction } from "./hosts/retra
 import { compactWrites, formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
 import { buildGraphWithProgress } from "./claude/build-progress.js";
 import { homedir } from "node:os";
-import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, runUpgrade } from "./cli-meta.js";
+import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, readPackageName, runUpgrade } from "./cli-meta.js";
+import { nativeFallbackNotice } from "./graph/native.js";
 import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
@@ -273,6 +274,10 @@ program.hook("preAction", (_parent, action) => {
   // hooks, CI and pipes never see it (see graftNotice).
   const renamed = graftNotice({ ran: spelling(action), tty: Boolean(process.stderr.isTTY) });
   if (renamed) console.error(renamed);
+  // Someone typing trail in a repo whose graft-era hooks can't reach it learns
+  // the one command that moves it (init itself is that command).
+  const stranded = action.name() === "init" ? null : strandedRepoNotice({ cwd: process.cwd(), tty: Boolean(process.stderr.isTTY) });
+  if (stranded) console.error(stranded);
   maybeRefreshInBackground();
   const nudge = formatUpdateNudge(currentVersion, readUpdateCache()?.latest);
   if (nudge) console.error(nudge);
@@ -595,6 +600,7 @@ grouped(program.command("build"), GROUP.setup)
         includeDirs: opts.includeDir,
         followSubmodules: followSubmodulesWasExplicit ? opts.followSubmodules : undefined,
         followNestedRepos: followNestedReposWasExplicit ? opts.followNestedRepos : undefined,
+        packageName: readPackageName(import.meta.url),
       });
       return;
     }
@@ -663,6 +669,10 @@ grouped(program.command("build"), GROUP.setup)
       { repo: buildRoot },
     );
     for (const e of g.errors) console.error(`✗ ${e}`);
+    // A language whose native grammar didn't load was parsed by its WASM stand-in:
+    // say which, and the install that fixes it. Nothing when everything loaded.
+    const fallbackNotice = nativeFallbackNotice(g.nativeFallback, readPackageName(import.meta.url));
+    if (fallbackNotice) console.error(fallbackNotice);
 
     const rel = relative(process.cwd(), g.contextDir) || "graft";
     if (process.env.GRAFT_NO_GITIGNORE) {
@@ -1713,6 +1723,7 @@ function wireTarget(
         mcp: opts.mcp,
         hooks: opts.hooks,
         global: opts.global,
+        brand: brand(),
       });
       for (const w of r.written) say(`✓ ${w.id}: ${w.path} (${w.action})`);
       for (const m of r.mcp) say(`✓ mcp ${m.id}: ${m.path} (${m.action})`);

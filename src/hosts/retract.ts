@@ -26,15 +26,20 @@
 import { readFileSync, writeFileSync, existsSync, rmSync, rmdirSync, statSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { HOSTS } from './registry.js';
+import { HOSTS, hostRelPath } from './registry.js';
 import { ALL_MARKERS, type Markers } from './sections.js';
 import { mcpTargets, stripTomlSection } from './mcp-config.js';
 import { hookTargets } from './codex-hooks.js';
+import { cursorHookTargets } from './cursor-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
 import { claudeGlobalTargets } from './claude-global.js';
 import { claudeTargets, claudeTargetsFor } from '../claude/init.js';
 import { isGraftAllowEntry, isGraftFooterRegex } from '../claude/settings-merge.js';
 import type { WriteScope } from './plan.js';
+import type { Brand } from '../brand.js';
+
+/** Both names a file can go by: graft's, and trail's in a repo that uses trail. */
+const NAMES: readonly Brand[] = ['graft', 'trail'];
 
 /** What a retraction did to one target. */
 export type RetractAction =
@@ -197,7 +202,7 @@ function removeJsonKey(path: string, topKey: string, apply: boolean): RetractAct
 }
 
 /**
- * Delete the `[mcp_servers.graft]` table from a TOML config.
+ * Delete the `[mcp_servers.graft]` and `[mcp_servers.trail]` tables from a TOML config.
  *
  * Line-based on purpose: a real TOML parse-and-reserialize would reformat the
  * user's whole file. The table runs from its header to the next `[`-header or
@@ -205,8 +210,10 @@ function removeJsonKey(path: string, topKey: string, apply: boolean): RetractAct
  */
 function removeTomlSection(path: string, apply: boolean): RetractAction {
   if (!existsSync(path)) return 'absent';
-  const { rest: kept, found } = stripTomlSection(readFileSync(path, 'utf8'));
-  if (!found) return 'absent';
+  const graft = stripTomlSection(readFileSync(path, 'utf8'), 'graft');
+  const trail = stripTomlSection(graft.rest, 'trail');
+  const kept = trail.rest;
+  if (!graft.found && !trail.found) return 'absent';
   if (!apply) return isBlank(kept) ? 'deleted' : 'removed';
   if (isBlank(kept)) return removeFile(path, true);
   writeFileSync(path, kept.endsWith('\n') ? kept : `${kept}\n`);
@@ -269,8 +276,12 @@ function stripClaudeSettings(path: string, apply: boolean): RetractAction {
   return 'removed';
 }
 
-/** Remove graft's PostToolUse/SessionStart/etc. entries from Codex's hooks.json. */
-function stripCodexHooks(path: string, apply: boolean): RetractAction {
+/**
+ * Remove graft's hook entries from a hooks config: Codex's `~/.codex/hooks.json`
+ * (PostToolUse/SessionStart/etc.), or Cursor's `.cursor/hooks.json`, whose
+ * schema `version` is graft's too, so a file holding nothing else goes.
+ */
+function stripHookEntries(path: string, apply: boolean, ours: string[] = []): RetractAction {
   if (!existsSync(path)) return 'absent';
   let root: Record<string, any>;
   try {
@@ -290,8 +301,9 @@ function stripCodexHooks(path: string, apply: boolean): RetractAction {
   }
   if (Object.keys(root.hooks).length === 0) delete root.hooks;
   if (JSON.stringify(root) === before) return 'absent';
-  if (!apply) return Object.keys(root).length === 0 ? 'deleted' : 'removed';
-  if (Object.keys(root).length === 0) return removeFile(path, true);
+  const empty = Object.keys(root).every((k) => ours.includes(k));
+  if (!apply) return empty ? 'deleted' : 'removed';
+  if (empty) return removeFile(path, true);
   writeFileSync(path, `${JSON.stringify(root, null, 2)}\n`);
   return 'removed';
 }
@@ -370,17 +382,20 @@ function targets(repo: string, opts: RetractOpts): Target[] {
    * rewrite it immediately afterwards. Exclude by path as well, so retraction
    * never depends on what runs next.
    */
+  // Under both names: init rewrites a kept host under the repo's name and
+  // clears the other name's copy itself.
   const keptPaths = new Set<string>();
   for (const host of HOSTS) {
-    if (exclude.has(host.id)) keptPaths.add(join(repo, host.relPath));
+    if (exclude.has(host.id)) for (const n of NAMES) keptPaths.add(join(repo, hostRelPath(host, n)));
   }
   for (const t of mcpTargets(repo, [...exclude], { home })) keptPaths.add(t.path);
   if (exclude.has('claude')) {
-    for (const n of ['graft', 'trail'] as const) for (const t of claudeTargetsFor(repo, n)) keptPaths.add(t.path);
+    for (const n of NAMES) for (const t of claudeTargetsFor(repo, n)) keptPaths.add(t.path);
     for (const t of claudeGlobalTargets(home)) keptPaths.add(t.path);
   }
   if (exclude.has('agents')) for (const t of hookTargets(home)) keptPaths.add(t.path);
-  if (exclude.has('antigravity')) for (const t of antigravitySkillTargets(home)) keptPaths.add(t.path);
+  if (exclude.has('cursor')) for (const n of NAMES) for (const t of cursorHookTargets(repo, n)) keptPaths.add(t.path);
+  if (exclude.has('antigravity')) for (const n of NAMES) for (const t of antigravitySkillTargets(home, n)) keptPaths.add(t.path);
 
   /** Queue a target unless a kept host owns that path, or it's already queued. */
   const seen = new Set<string>();
@@ -390,16 +405,18 @@ function targets(repo: string, opts: RetractOpts): Target[] {
     out.push(t);
   };
 
-  // 1. Instruction files, one per host. Owned files go wholesale; shared files
-  //    lose only their fenced block.
+  // 1. Instruction files, one per host and name. Owned files go wholesale;
+  //    shared files lose only their fenced block (either name's).
   for (const host of HOSTS) {
     if (exclude.has(host.id)) continue;
-    const path = join(repo, host.relPath);
-    add(
-      host.kind === 'owned'
-        ? { hostId: host.id, path, what: 'graft-owned instruction file', scope: 'repo', run: (a) => removeFile(path, a) }
-        : { hostId: host.id, path, what: 'fenced graft section', scope: 'repo', run: (a) => stripSection(path, a) },
-    );
+    for (const n of NAMES) {
+      const path = join(repo, hostRelPath(host, n));
+      add(
+        host.kind === 'owned'
+          ? { hostId: host.id, path, what: `${n}-owned instruction file`, scope: 'repo', run: (a) => removeFile(path, a) }
+          : { hostId: host.id, path, what: 'fenced graft section', scope: 'repo', run: (a) => stripSection(path, a) },
+      );
+    }
   }
 
   // 1b. Instruction files from hosts that no longer exist in the registry.
@@ -442,6 +459,15 @@ function targets(repo: string, opts: RetractOpts): Target[] {
     ] as Target[]) add(t);
   }
 
+  // 3b. Cursor's repo-local hooks: the shim under either name, and the entries.
+  if (!exclude.has('cursor')) {
+    for (const n of NAMES) {
+      const [shim, config] = cursorHookTargets(repo, n);
+      add({ hostId: 'cursor', path: shim.path, what: shim.what, scope: 'repo', run: (a) => removeFile(shim.path, a) });
+      add({ hostId: 'cursor', path: config.path, what: config.what, scope: 'repo', run: (a) => stripHookEntries(config.path, a, ['version']) });
+    }
+  }
+
   // 4. Global: Claude Code's user-level copy, Codex's hook shim + entries, and
   //    Antigravity's shared skill.
   if (opts.global !== false) {
@@ -457,12 +483,12 @@ function targets(repo: string, opts: RetractOpts): Target[] {
       for (const t of hookTargets(home)) {
         add({
           hostId: t.hostId, path: t.path, what: t.what, scope: 'global',
-          run: (a) => (t.path.endsWith('.json') ? stripCodexHooks(t.path, a) : removeFile(t.path, a)),
+          run: (a) => (t.path.endsWith('.json') ? stripHookEntries(t.path, a) : removeFile(t.path, a)),
         });
       }
     }
     if (!exclude.has('antigravity')) {
-      for (const t of antigravitySkillTargets(home)) {
+      for (const t of NAMES.flatMap((n) => antigravitySkillTargets(home, n))) {
         add({ hostId: t.hostId, path: t.path, what: t.what, scope: 'global', run: (a) => removeFile(t.path, a) });
       }
     }

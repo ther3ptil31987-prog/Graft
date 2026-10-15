@@ -29,7 +29,7 @@ import { durationBucket } from "../telemetry/contract.js";
 import { track } from "../telemetry/track.js";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 import { claimHandoff, readCloud, registerHandoff, SECRET_FILE_MODE, trailUrl, writeCloud, type ClaimResult, type HandoffRepo } from "./workspace.js";
-import { syncWorkspaceRepos } from "./workspace-sync.js";
+import { dropActivity, syncWorkspaceRepos } from "./workspace-sync.js";
 
 /** What the link says, in turn: one per session, so it never reads the same twice running. */
 export const NUDGE_WORDS = ["Share your learnings with your team?", "See what your Claude has learned"] as const;
@@ -285,6 +285,9 @@ export async function waitForConnect(opts: WaitOptions = {}): Promise<ClaimResul
       const got = await claimHandoff(base, pending.state, opts.fetchImpl);
       if ("cloud" in got) {
         const cloud = { ...got.cloud, url: base, linkedAt: now() };
+        // Nothing from before signing in goes up: an older trail queued uses
+        // whether or not anyone had connected.
+        dropActivity(env);
         writeCloud(cloud, env);
         const sent = await syncWorkspaceRepos(cloud, opts.fetchImpl);
         done({ pending: undefined, linked: { workspace: cloud.workspace.name, url: cloud.workspace.url, repos: sent.repos, learnings: sent.learnings } });

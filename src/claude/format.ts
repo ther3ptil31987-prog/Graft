@@ -79,7 +79,7 @@ export function formatBlastRadius(w: GraphV1, filePath: string, cap = 8): string
     return ` • ${e.relation} ← ${label}`;
   });
   const more = edges.length > cap ? `\n • +${edges.length - cap} more` : '';
-  return `[graft] blast radius for ${basename(filePath)}, who depends on it:\n${items.join('\n')}${more}`;
+  return `${tag()} blast radius for ${basename(filePath)}, who depends on it:\n${items.join('\n')}${more}`;
 }
 
 export interface AskJson {
@@ -220,8 +220,8 @@ export function weakMatchNudge(s: SessionState, strong: number): string | null {
   if (spent >= NUDGE_CAP) return null;
   s.nudges = spent + 1;
   return (
-    `[graft] no strong match for this prompt (name-field match ${strong.toFixed(2)}) — the graph ` +
-    `has more than this probe found. Run \`graft ask "<your task>" --source\` before grepping.`
+    `${tag()} no strong match for this prompt (name-field match ${strong.toFixed(2)}) — the graph ` +
+    `has more than this probe found. Run \`${cmd('graft ask')} "<your task>" --source\` before grepping.`
   );
 }
 

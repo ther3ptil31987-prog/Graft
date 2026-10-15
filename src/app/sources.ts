@@ -215,10 +215,10 @@ export function skillFiles(root: string, max = MAX_SKILL_FILES): string[] {
   return out;
 }
 
-/** Remove graft's own fenced regions, so the brain never learns graft from graft. */
+/** Remove graft's own fenced regions (trail's too), so the brain never learns graft from graft. */
 function stripManagedBlocks(text: string): string {
   return text
-    .replace(/<!--\s*graft:(brain:)?start\s*-->[\s\S]*?<!--\s*graft:(brain:)?end\s*-->/g, "")
+    .replace(/<!--\s*(graft|trail):(brain:)?start\s*-->[\s\S]*?<!--\s*\1:(brain:)?end\s*-->/g, "")
     .trim();
 }
 

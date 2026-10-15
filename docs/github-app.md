@@ -1,4 +1,4 @@
-# The graft GitHub App
+# The Trail-code GitHub App
 
 Posts a blast-radius comment on every pull request, and hosts the interactive
 graph behind a signed link.

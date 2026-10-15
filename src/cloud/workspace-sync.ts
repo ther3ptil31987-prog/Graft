@@ -8,10 +8,11 @@
  * repo. Personal learnings in ~/.trail never go up.
  *
  * Uses (a search that showed learnings, a check against them) are appended to
- * `~/.trail/outbox.jsonl` as they happen, whether or not the machine is
- * connected yet, and sent with the next sync. That's how a teammate's reuse
- * of a learning shows on the team page, including reuse from before they
- * connected.
+ * `~/.trail/outbox.jsonl` as they happen, and sent with the next sync. That's
+ * how a teammate's reuse of a learning shows on the team page. Only while the
+ * machine is connected, and only for a repo in the workspace: a search holds
+ * what someone typed and the files they're in, and nobody agreed to send that
+ * for a repo they didn't pick, or from before they signed in.
  *
  * Commands never wait on any of this: when something changed, a detached
  * `_trail-sync` child does it.
@@ -133,12 +134,22 @@ export async function syncWorkspaceRepos(cloud: Cloud, fetchImpl?: typeof fetch)
 /* the activity outbox                                                        */
 /* -------------------------------------------------------------------------- */
 
-function outboxPath(): string {
-  return join(trailHome(), "outbox.jsonl");
+function outboxPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(trailHome(env), "outbox.jsonl");
 }
 
-/** Remember one use of the learnings, to send with the next sync. Never throws. */
-export function recordActivity(e: ActivityEvent): void {
+/** Whether a use may go to `cloud`: the repo is the workspace's, and it happened since connecting. */
+function sendable(e: ActivityEvent, cloud: Cloud): boolean {
+  return cloud.repos.includes(e.repo) && Date.parse(e.at) >= (cloud.linkedAt || 0);
+}
+
+/**
+ * Remember one use of the learnings, to send with the next sync: only while
+ * this machine is connected, and only for a repo in the workspace. Not
+ * connected, or another repo, and nothing is written. Never throws.
+ */
+export function recordActivity(e: ActivityEvent, cloud: Cloud | null = readCloud()): void {
+  if (!cloud || !cloud.repos.includes(e.repo)) return;
   try {
     const p = outboxPath();
     appendFileSync(p, `${JSON.stringify(e)}\n`);
@@ -148,6 +159,18 @@ export function recordActivity(e: ActivityEvent): void {
     }
   } catch {
     /* a lost event undercounts reuse by one */
+  }
+}
+
+/**
+ * Forget every use waiting to go. Run when a machine connects, so nothing
+ * recorded before that is ever sent.
+ */
+export function dropActivity(env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    rmSync(outboxPath(env), { force: true });
+  } catch {
+    /* sent-time filtering in flushActivity drops them anyway */
   }
 }
 
@@ -161,7 +184,9 @@ function outboxHasEvents(): boolean {
 
 /**
  * Send the outbox. It's moved aside first, so events recorded while the
- * request is out land in a fresh file; on failure they're put back.
+ * request is out land in a fresh file; on failure they're put back. A use
+ * from before this connection, or for a repo the workspace doesn't have
+ * (left by an older trail), is dropped, never sent.
  */
 export async function flushActivity(cloud: Cloud, fetchImpl?: typeof fetch): Promise<number> {
   const p = outboxPath();
@@ -175,7 +200,9 @@ export async function flushActivity(cloud: Cloud, fetchImpl?: typeof fetch): Pro
   const events: ActivityEvent[] = [];
   for (const line of readFileSync(sending, "utf8").split("\n")) {
     try {
-      if (line.trim()) events.push(JSON.parse(line) as ActivityEvent);
+      if (!line.trim()) continue;
+      const e = JSON.parse(line) as ActivityEvent;
+      if (sendable(e, cloud)) events.push(e);
     } catch {
       /* a torn line */
     }

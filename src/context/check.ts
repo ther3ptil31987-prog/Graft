@@ -19,7 +19,7 @@ import { relPosix } from "../util/paths.js";
 import { readSourceFile } from "../util/source.js";
 import { CODE_EXTENSIONS, listContextFiles } from "./build.js";
 import { contextDirFor, readManifest, readNodes } from "./node-file.js";
-import { cmd } from "../brand.js";
+import { brand, cmd } from "../brand.js";
 
 export interface CheckResult {
   ok: boolean;
@@ -146,9 +146,9 @@ export function indexFreshness(dir: string, opts: CheckOptions = {}): FreshnessR
 export function staleBanner(f: FreshnessResult | null): string | null {
   if (!f || f.missing === 0) return null;
   return (
-    `⚠ graft's index may be ahead of your working tree: ${f.missing} of ${f.total} indexed ` +
-    `files are not on disk (branch switch or uncommitted move?). If graft names a path that ` +
-    `isn't there, don't chase it — \`graft grep\` the symbol to find where it lives now; run \`graft build\` to refresh.`
+    `⚠ ${brand()}'s index may be ahead of your working tree: ${f.missing} of ${f.total} indexed ` +
+    `files are not on disk (branch switch or uncommitted move?). If ${brand()} names a path that ` +
+    `isn't there, don't chase it — \`${cmd("graft grep")}\` the symbol to find where it lives now; run \`${cmd("graft build")}\` to refresh.`
   );
 }
 

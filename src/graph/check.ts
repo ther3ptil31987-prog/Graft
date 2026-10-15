@@ -20,10 +20,10 @@
 import { resolve } from "node:path";
 import { relPosix } from "../util/paths.js";
 import { contextDirFor } from "../context/node-file.js";
-import { extractFile, languageOf } from "./extract.js";
-import { extractGeneric, genericLangOf, warmGenericGrammars } from "./generic.js";
-import { containerLangOf, extractContainer, warmContainerGrammars } from "./container.js";
-import { listSourceFiles } from "./build.js";
+import { extractFile } from "./extract.js";
+import { extractGeneric } from "./generic.js";
+import { extractContainer } from "./container.js";
+import { listSourceFiles, tierOf, warmGrammarsFor } from "./build.js";
 import { readGraph, wiringPath } from "./write.js";
 import { readFingerprint } from "./fingerprint.js";
 import { readSourceFile } from "../util/source.js";
@@ -88,25 +88,19 @@ export async function checkGraph(
   const fpOnlyDirs = readFingerprint(outDir)?.onlyDirs;
   const onlyDirs = fpOnlyDirs && fpOnlyDirs.length > 0 ? new Set(fpOnlyDirs) : undefined;
   const sourceFiles = listSourceFiles(root, outDir, undefined, onlyDirs);
-  await warmGenericGrammars(
-    new Set(sourceFiles.map((f) => genericLangOf(f)?.name).filter((n): n is string => !!n)),
-  );
   // Container-tier grammars need the same warmup as the generic ones, for the same
-  // reason: extraction below is synchronous. Missing this is what made `graft
+  // reason: extraction below is synchronous. Missing that is what made `graft
   // check` report every `.vue` node as `removed` right after a clean build (#236)
   // — the tier extracted fine, and then the check had no branch that could see it.
-  await warmContainerGrammars(
-    new Set(sourceFiles.map((f) => containerLangOf(f)?.name).filter((n): n is string => !!n)),
-  );
+  // The same call warms the WASM stand-in for a depth language whose native
+  // grammar didn't load, exactly as the build does.
+  await warmGrammarsFor(sourceFiles);
   const current = new Map<string, string>(); // id → body_hash
   for (const file of sourceFiles) {
-    // The same three-way branch `buildGraph` uses, in the same order. The two must
-    // stay in step: a tier the build extracts and the check cannot see reports as
-    // `removed` forever, and the `graft build` the check tells you to run can never
-    // repair it.
-    const lang = languageOf(file);
-    const container = lang ? null : containerLangOf(file);
-    const generic = lang || container ? null : genericLangOf(file);
+    // The same dispatch `buildGraph` uses (`tierOf`). The two must stay in step: a
+    // tier the build extracts and the check cannot see reports as `removed`
+    // forever, and the `graft build` the check tells you to run can never repair it.
+    const { lang, container, generic } = tierOf(file);
     let source: string | null;
     try {
       source = readSourceFile(file);

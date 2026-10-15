@@ -33,7 +33,7 @@ function fixture(): string {
   put(root, '.claude/skills/deploy/SKILL.md', '---\nname: deploy\n---\nAlways deploy from main.\n');
   put(root, '.claude/skills/graft/SKILL.md', '---\nname: graft\n---\ngraft teaches graft\n');
   put(root, '.claude/skills/empty/README.md', 'no skill file here\n');
-  put(root, 'web/AGENTS.md', 'before\n<!-- graft:start -->\ngraft block\n<!-- graft:end -->\nafter\n');
+  put(root, 'web/AGENTS.md', 'before\n<!-- graft:start -->\ngraft block\n<!-- graft:end -->\nafter\n<!-- trail:start -->\ntrail block\n<!-- trail:end -->\n');
   return root;
 }
 
@@ -75,6 +75,7 @@ test('readAgentInstructions carries them all as agent_instructions, graft blocks
   assert.ok(got.every((s) => s.kind === 'agent_instructions'));
   const web = got.find((s) => s.path === 'web/AGENTS.md')!;
   assert.doesNotMatch(web.text, /graft block/);
+  assert.doesNotMatch(web.text, /trail block/, 'the block trail init writes is stripped too');
   assert.match(web.text, /before[\s\S]*after/);
   assert.ok(!paths.includes('.claude/skills/graft/SKILL.md'));
 });

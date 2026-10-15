@@ -408,19 +408,20 @@ export async function runPicker(
  */
 export function formatNonInteractiveHelp(detectedIds: string[]): string {
   const list = detectedIds.length > 0 ? detectedIds.join(", ") : "none";
+  const b = brand();
   const examples: [string, string][] = [
     ...(detectedIds.length > 0
       ? ([
-          [`graft init --agents ${detectedIds.join(" ")}`, "wire these"],
-          ["graft init --yes", "same, without spelling them out"],
+          [`${b} init --agents ${detectedIds.join(" ")}`, "wire these"],
+          [`${b} init --yes`, "same, without spelling them out"],
         ] as [string, string][])
       : []),
-    ["graft init --agents claude", "Claude Code only"],
-    ["graft init --dry-run", "list every file first"],
+    [`${b} init --agents claude`, "Claude Code only"],
+    [`${b} init --dry-run`, "list the agent wiring first"],
   ];
   const width = Math.max(...examples.map(([cmd]) => cmd.length));
   return [
-    "graft init: no TTY to prompt on, and no --agents/--yes given — nothing written.",
+    `${b} init: no TTY to prompt on, and no --agents/--yes given — nothing written.`,
     `detected: ${list}`,
     "",
     ...examples.map(([cmd, note]) => `  ${cmd.padEnd(width)}   # ${note}`),
@@ -440,7 +441,9 @@ export function formatPlan(
 ): string {
   const dim = tty ? muted : (s: string) => s;
   const warn = tty ? amber : (s: string) => s;
-  const writes = plan.filter((p) => ids.includes(p.id)).flatMap((p) => p.writes);
+  // Codex, Hermes and Antigravity all write AGENTS.md: list each write once.
+  const all = plan.filter((p) => ids.includes(p.id)).flatMap((p) => p.writes);
+  const writes = [...new Map(all.map((w) => [`${w.path}\0${w.what}`, w])).values()];
   if (writes.length === 0) return 'would write — nothing (no agents selected)';
 
   const pad = (rows: PlannedWrite[], f: (p: string) => string) => {

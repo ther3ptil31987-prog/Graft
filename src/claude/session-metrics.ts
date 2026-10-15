@@ -36,6 +36,7 @@ import { dollarsSaved, formatDollars } from '../context/price.js';
 import { readSession, writeSession, sessionDir, listSessionIds, type SessionState } from './state.js';
 import type { AgentHost } from '../telemetry/contract.js';
 import { GRAFT_MCP_TOOL_NAMES } from '../mcp/tool-names.js';
+import { brand, cmd } from '../brand.js';
 
 export type ToolKind = 'graft' | 'source';
 
@@ -79,7 +80,7 @@ export function commandInvokesGraft(command: string): boolean {
   // running from a source checkout
   if (/dist[/\\](cli|bin[/\\](trail|graft))\.js/.test(c)) return true;
   // `graft …`, `graft-dev …`, `npx [-y] [@nanonets/]graft …`, and the same for
-  // `trail` / `@trailhq/trail`, at the start of the line or of a &&/;/| segment —
+  // `trail` / `@trailhq/trail-code`, at the start of the line or of a &&/;/| segment —
   // not "mygraft" or a path that merely contains it.
   return /(^|[|&;]\s*)(npx\s+(-y\s+)?(@nanonets\/|@trailhq\/)?)?(graft|trail)(-dev)?\b/i.test(c);
 }
@@ -188,7 +189,7 @@ export function sessionInputRate(dir: string): number | null {
 
 export function formatSessionStats(s: SessionSummary | null): string {
   if (s === null) {
-    return 'graft stats: no session recorded yet — use graft in an agent session, then look again.';
+    return `${cmd('graft stats')}: no session recorded yet — use ${brand()} in an agent session, then look again.`;
   }
   const graft = s.graftReads ?? 0;
   const source = s.sourceReads ?? 0;
@@ -197,7 +198,7 @@ export function formatSessionStats(s: SessionSummary | null): string {
   const mix =
     total === 0 ? 'no retrieval yet' : `${Math.round((graft / total) * 100)}% graft`;
   const lines = [
-    `graft stats — session ${s.id}`,
+    `${cmd('graft stats')} — session ${s.id}`,
     `  graft reads:   ${graft}`,
     `  source reads:  ${source}   (Read / Grep / Glob)`,
     `  mix:           ${mix}`,

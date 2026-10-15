@@ -29,8 +29,8 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { readJson, writeJsonAtomic, cacheDir } from './util/state.js';
-import { HOSTS } from './hosts/registry.js';
-import { START } from './hosts/sections.js';
+import { HOSTS, hostRelPath } from './hosts/registry.js';
+import { markersFor } from './hosts/sections.js';
 import { getNpmViewVersion, readCurrentVersion } from './cli-meta.js';
 import { brand } from './brand.js';
 import { graftCliPath } from './claude/paths.js';
@@ -232,14 +232,18 @@ export function wiredHostIds(repo: string): string[] {
   const ids: string[] = [];
   if (['graft', 'trail'].some((n) => existsSync(join(repo, '.claude', 'helpers', `${n}-hooks.cjs`)))) ids.push('claude');
   for (const host of HOSTS) {
-    const path = join(repo, host.relPath);
-    if (!existsSync(path)) continue;
-    // A shared file (AGENTS.md, GEMINI.md) counts only if graft's fenced section
-    // is in it — the user may own the file for entirely unrelated reasons.
-    if (host.kind === 'section') {
-      try { if (!readFileSync(path, 'utf8').includes(START)) continue; } catch { continue; }
-    }
-    ids.push(host.id);
+    // Under either name: a repo on trail has trail's files and blocks.
+    const wired = (['graft', 'trail'] as const).some((n) => {
+      const path = join(repo, hostRelPath(host, n));
+      if (!existsSync(path)) return false;
+      // A shared file (AGENTS.md, GEMINI.md) counts only if graft's fenced section
+      // is in it — the user may own the file for entirely unrelated reasons.
+      if (host.kind === 'section') {
+        try { return readFileSync(path, 'utf8').includes(markersFor(n).start); } catch { return false; }
+      }
+      return true;
+    });
+    if (wired) ids.push(host.id);
   }
   return ids;
 }

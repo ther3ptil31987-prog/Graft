@@ -27,8 +27,8 @@ for (const [name, src] of [['statusline', statuslineShim()], ['hooks', hooksShim
     assert.match(src, /st\.uid !== process\.getuid\(\)/);
     assert.match(src, /st\.mode & 0o022/);
     // 2. repo node_modules via require.resolve from the project dir
-    // under both names: a teammate with only @trailhq/trail installed still gets hooks
-    assert.match(src, /const PKGS = \['@trailhq\/trail', '@nanonets\/graft'\];/);
+    // under both names: a teammate with only @trailhq/trail-code installed still gets hooks
+    assert.match(src, /const PKGS = \['@trailhq\/trail-code', '@nanonets\/graft', '@trailhq\/trail'\];/);
     assert.match(src, /require\.resolve\(name \+ '\/package\.json', \{ paths: \[base\] \}\)/);
     assert.match(src, /fromPkg\(dir\)/);
     // 3. legacy execPath/../lib guess retained

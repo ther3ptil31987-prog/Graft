@@ -1,10 +1,10 @@
 /**
- * Lays out the `@trailhq/trail` package from this repo's build, in build/trail/.
+ * Lays out the `@trailhq/trail-code` package from this repo's build, in build/trail/.
  *
  * trail and graft are one program under two names, published as two packages
  * from the same `dist/`:
  *
- *   @trailhq/trail   bin: trail  →  dist/bin/trail.js
+ *   @trailhq/trail-code  bin: trail  →  dist/bin/trail.js
  *   @nanonets/graft  bin: graft  →  dist/bin/graft.js   (this repo's package.json)
  *
  * Each package ships exactly one command, so installing both never clashes on
@@ -32,7 +32,7 @@ if (!existsSync(join(root, 'dist', 'bin', 'trail.js'))) {
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 const trail = {
   ...pkg,
-  name: '@trailhq/trail',
+  name: '@trailhq/trail-code',
   description:
     "Your team's shared memory for coding agents: a code map on your machine, and the learnings, decisions and skills your whole team shares. Formerly graft.",
   keywords: [...new Set(['trail', ...(pkg.keywords ?? [])])],

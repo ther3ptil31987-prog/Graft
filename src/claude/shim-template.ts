@@ -49,9 +49,10 @@ const { pathToFileURL } = require('url');
 const { execFileSync } = require('child_process');
 const dir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
-// The same code ships as @trailhq/trail and as @nanonets/graft, its old name;
-// either one answers, and the newer wins.
-const PKGS = ['@trailhq/trail', '@nanonets/graft'];
+// The same code ships as @trailhq/trail-code and as @nanonets/graft, its old name;
+// either one answers, and the newer wins. @trailhq/trail is what builds from
+// source were called before the package was published.
+const PKGS = ['@trailhq/trail-code', '@nanonets/graft', '@trailhq/trail'];
 const BINS = process.platform === 'win32' ? ['trail.cmd', 'graft.cmd'] : ['trail', 'graft'];
 
 // The dist/claude dir this machine's last init ran from, kept in the trail home

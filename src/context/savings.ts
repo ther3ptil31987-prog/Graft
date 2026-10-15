@@ -90,11 +90,12 @@ export function setInputRate(usdPerMtok: number | null): void {
  * `hasSavingsTally` (claude/tally.ts) recognises, so adding money here does not
  * quietly zero the reported-turns metric. */
 export function savingsTurnNudge(savedTokens: number): string {
-  const sum = ' — sum each such line across your graft calls — e.g. ';
+  const b = brand();
+  const sum = ` — sum each such line across your ${b} calls — e.g. `;
   if (inputRateUsdPerMtok === null || savedTokens <= 0) {
     return (
-      ' At the end of your reply, tell the user the total graft tokens saved ' +
-      `this turn${sum}"🌱 graft saved ~N tokens this turn".`
+      ` At the end of your reply, tell the user the total ${b} tokens saved ` +
+      `this turn${sum}"🌱 ${b} saved ~N tokens this turn".`
     );
   }
   const usd = (savedTokens * inputRateUsdPerMtok) / 1_000_000;

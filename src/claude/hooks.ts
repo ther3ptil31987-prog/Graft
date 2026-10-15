@@ -10,13 +10,15 @@ import { indexFreshness, staleBanner } from '../context/check.js';
 import { patchStats, readStats, acquireLock, readSession, writeSession, resolveContextDir } from './state.js';
 import { graftCliPath, claudeScriptPath } from './paths.js';
 import { runUpkeep } from '../upkeep-run.js';
-import { runningVersion } from '../upkeep.js';
+import { runningVersion, wiredHostIds } from '../upkeep.js';
+import { hostsWiredForTrail } from '../hosts/registry.js';
 import { flushClosedSessions, summarizeSession } from '../telemetry/sessions.js';
 import { hasSavingsTally, lastAssistantTurn, lastTurnBilling } from './tally.js';
 import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
 import { classifyToolUse, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
-import { adoptRepoBrand, brand, cmd, commandOnPath, repoWiredForTrail, tag, trailOnPath } from '../brand.js';
+import { adoptRepoBrand, brand, cmd, commandOnPath, repoWiredForTrail, tag, trailHandoverLine, trailOnPath } from '../brand.js';
 import { fitTrailServerToMachine } from '../hosts/claude-global.js';
+import { globalCopyCovers } from './hook-layers.js';
 import { NOTE_CALL } from '../notes/session-cost.js';
 import { keepsNotes, noteCount, repoPlace } from '../notes/home.js';
 import { branchesStale, refreshBranches, SESSION_REFRESH_MS } from '../notes/branches.js';
@@ -572,9 +574,11 @@ function trailAtStart(dir: string): void {
 export async function main(event: string): Promise<void> {
   // trail's own headless Claude calls (the first-run read of past sessions) run with this set.
   if (process.env.TRAIL_NO_HOOKS === '1') return;
+  // Registered in the repo and in ~/.claude, Claude Code runs both: one answers.
+  if (globalCopyCovers(event, process.argv[1])) return;
   const input = readStdin();
   const dir = projectDir(input);
-  adoptRepoBrand(dir);
+  adoptRepoBrand(dir, process.env, hostsWiredForTrail);
 
   if (event === 'session-start') {
     // Before anything is emitted: refresh this repo's wiring if it was written by
@@ -582,6 +586,10 @@ export async function main(event: string): Promise<void> {
     // background:false — the registry check stays off the network here; the CLI
     // and the MCP server fill that cache, this only reads it.
     const upkeep = runUpkeep(dir, runningVersion(), { background: false }).lines;
+    // On graft without trail, in a repo graft set up: once a week, the agent
+    // tells the person how to get it.
+    const handover = wiredHostIds(dir).includes('claude') ? trailHandoverLine() : null;
+    if (handover) upkeep.push(handover);
     // Roll up any session that ended since we were last here. Queue-only — the
     // hook still sends nothing; the CLI or the MCP server sends it later.
     flushClosedSessions(dir);

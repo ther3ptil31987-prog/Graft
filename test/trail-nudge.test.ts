@@ -10,7 +10,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRAND_ENV } from "../src/brand.js";
@@ -159,6 +159,23 @@ test("the background wait registers the link with the picker's repos, then conne
   assert.match(told[1]!, /^✓ shared 1 learning from 1 repo · http:\/\/trail\.test\/w\/acme$/);
   assert.match(told[2]!, /Tell the user once/);
   assert.deepEqual(lines(dir, "ask", "s3"), [], "only once");
+});
+
+test("connecting sends nothing queued before it, whatever its timestamp", async () => {
+  freshHome();
+  const { dir, key } = repo();
+  lines(dir, "ask", "s1");
+  // What an older trail left: a search from before anyone signed in, in this repo and another.
+  const at = new Date(Date.now() + 60_000).toISOString();
+  const old = (repo: string) => JSON.stringify({ repo, kind: "search", asker: "Priya", session: "s0", query: "rate limit", files: ["a.go"], shown_paths: ["x.md"], shown_authors: ["Priya"], at });
+  const outbox = join(process.env.TRAIL_HOME!, "outbox.jsonl");
+  writeFileSync(outbox, `${old(key)}\n${old("github.com/acme/private")}\n`);
+  const trail = fakeTrail();
+  const got = await waitForConnect({ fetchImpl: trail.fetchImpl, sleep: async () => {} });
+  assert.ok(got && "cloud" in got);
+  assert.equal(trail.sent.filter((s) => s.path === "/api/cli/activity").length, 0, "no activity sent");
+  assert.equal(existsSync(outbox), false, "and none kept to send later");
+  rmSync(join(process.env.TRAIL_HOME!, "cloud.json"));
 });
 
 test("a spent link stops the wait and is forgotten, so the next session mints a new one", async () => {
