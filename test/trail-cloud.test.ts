@@ -92,7 +92,7 @@ test("a learning on a teammate's pushed branch reaches the other clone before it
   const overlaps = overlapsWith(anirudh, ["client.go", "backoff.go"], "Anirudh");
   assert.equal(overlaps.length, 1);
   assert.deepEqual(overlaps[0]!.shared, ["client.go"]);
-  assert.match(formatOverlap(overlaps[0]!), /^● overlap · Kumar's branch kumar\/jitter also changes client\.go \(pushed /);
+  assert.match(formatOverlap(overlaps[0]!), /^🔀 trail · Kumar's branch kumar\/jitter also changes client\.go \(pushed /);
   assert.deepEqual(overlapsWith(kumar, ["client.go"], "Kumar", cache), [], "your own branch isn't overlap");
 
   // Once it merges and Anirudh pulls, it's the working tree's copy, listed once.

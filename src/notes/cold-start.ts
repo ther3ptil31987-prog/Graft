@@ -12,7 +12,7 @@
  * more sessions, and counts the sessions itself.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { countBucket, durationBucket } from "../telemetry/contract.js";
@@ -326,9 +326,50 @@ interface RawFinding {
 }
 
 /** Whether `claude` (Claude Code) is on PATH. */
-export function hasClaude(): boolean {
+function claudeOnPath(): boolean {
   const r = spawnSync("claude", ["--version"], { stdio: "ignore", timeout: 10_000 });
   return r.status === 0;
+}
+
+/** `[2, 1, 296]` from `anthropic.claude-code-2.1.296-darwin-arm64`; null for anything else. */
+function extensionVersion(name: string): number[] | null {
+  const m = /^anthropic\.claude-code-(\d+)\.(\d+)\.(\d+)/.exec(name);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * The Claude Code to run: `claude` on PATH, else a standalone install's copy,
+ * else the newest copy the VS Code, Cursor, VS Code Insiders or Windsurf
+ * extension keeps. Someone who only uses the extension has no `claude` on
+ * PATH, and without this their past sessions are never read. Null when
+ * there's none.
+ */
+export function claudeBin(home: string = homedir(), onPath: () => boolean = claudeOnPath): string | null {
+  if (onPath()) return "claude";
+  const exe = process.platform === "win32" ? "claude.exe" : "claude";
+  for (const p of [join(home, ".local", "bin", exe), join(home, ".claude", "local", exe)]) if (existsSync(p)) return p;
+  const copies: { version: number[]; path: string }[] = [];
+  for (const editor of [".vscode", ".cursor", ".vscode-insiders", ".windsurf"]) {
+    const dir = join(home, editor, "extensions");
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const version = extensionVersion(name);
+      const path = join(dir, name, "resources", "native-binary", exe);
+      if (version && existsSync(path)) copies.push({ version, path });
+    }
+  }
+  copies.sort((a, b) => b.version[0]! - a.version[0]! || b.version[1]! - a.version[1]! || b.version[2]! - a.version[2]!);
+  return copies[0]?.path ?? null;
+}
+
+/** Whether there's a Claude Code to run, on PATH or not. */
+export function hasClaude(home?: string): boolean {
+  return claudeBin(home) !== null;
 }
 
 /**
@@ -336,15 +377,23 @@ export function hasClaude(): boolean {
  * servers, no slash commands, nothing saved as a session (so this run never
  * shows up as a past session), from a scratch folder so no repo's CLAUDE.md or
  * hooks load. `TRAIL_NO_HOOKS` keeps trail's own user-level hooks quiet too.
+ * Past sessions by default; the PR review read brings its own system prompt
+ * and schema, with `findings` at the top.
  */
-function askClaude(prompt: string, model: string, timeoutMs: number): Promise<{ findings: RawFinding[]; costUsd?: number } | null> {
+export function askClaude<T = RawFinding>(
+  bin: string,
+  prompt: string,
+  model: string,
+  timeoutMs: number,
+  ask: { system: string; schema: object } = { system: SYSTEM, schema: SCHEMA },
+): Promise<{ findings: T[]; costUsd?: number } | null> {
   return new Promise((done) => {
     const args = [
       "-p",
       "--model", model,
       "--output-format", "json",
-      "--json-schema", JSON.stringify(SCHEMA),
-      "--system-prompt", SYSTEM,
+      "--json-schema", JSON.stringify(ask.schema),
+      "--system-prompt", ask.system,
       "--tools", "",
       "--strict-mcp-config",
       "--no-session-persistence",
@@ -352,7 +401,7 @@ function askClaude(prompt: string, model: string, timeoutMs: number): Promise<{ 
     ];
     let child;
     try {
-      child = spawn("claude", args, { cwd: tmpdir(), env: { ...process.env, TRAIL_NO_HOOKS: "1" }, stdio: ["pipe", "pipe", "ignore"] });
+      child = spawn(bin, args, { cwd: tmpdir(), env: { ...process.env, TRAIL_NO_HOOKS: "1" }, stdio: ["pipe", "pipe", "ignore"] });
     } catch {
       done(null);
       return;
@@ -367,7 +416,7 @@ function askClaude(prompt: string, model: string, timeoutMs: number): Promise<{ 
     child.on("close", () => {
       clearTimeout(timer);
       try {
-        const r = JSON.parse(out) as { is_error?: boolean; structured_output?: { findings?: RawFinding[] }; total_cost_usd?: number };
+        const r = JSON.parse(out) as { is_error?: boolean; structured_output?: { findings?: T[] }; total_cost_usd?: number };
         if (r.is_error || !r.structured_output) return done(null);
         done({ findings: r.structured_output.findings ?? [], costUsd: r.total_cost_usd });
       } catch {
@@ -383,12 +432,42 @@ function askClaude(prompt: string, model: string, timeoutMs: number): Promise<{ 
 /* Keeping only what's really there                                           */
 /* -------------------------------------------------------------------------- */
 
-function norm(s: string): string {
+export function norm(s: string): string {
   return s
     .toLowerCase()
     .replace(/[“”"'`‘’]/g, "")
     .replace(/[^\p{L}\p{N}]+/gu, " ")
     .trim();
+}
+
+/** Where a finding's quotes can be: one past session's messages, or one PR's review comments. */
+export interface QuoteSource {
+  id: string;
+  /** ISO time, for newest first. */
+  at: string;
+  /** What was said there, each through norm(). */
+  said: string[];
+}
+
+/**
+ * The sources a finding's quotes really are in, newest first, and the quotes
+ * that were found. A quote filed under the wrong source still counts for the
+ * one it's in; a quote under three words proves nothing.
+ */
+export function placeQuotes(evidence: { cited?: QuoteSource; quote?: string }[], sources: QuoteSource[]): { places: QuoteSource[]; quotes: string[] } {
+  const found = new Map<string, QuoteSource>();
+  const quotes: string[] = [];
+  for (const ev of evidence) {
+    const q = norm(ev.quote ?? "");
+    if (q.split(" ").length < 3) continue;
+    const has = (x: QuoteSource) => x.said.some((w) => w.includes(q));
+    // Misfiled: the source it's really in, one not counted yet when there is one.
+    const hit = ev.cited && has(ev.cited) ? ev.cited : (sources.find((x) => has(x) && !found.has(x.id)) ?? sources.find(has));
+    if (!hit) continue;
+    found.set(hit.id, hit);
+    quotes.push(ev.quote!.trim());
+  }
+  return { places: [...found.values()].sort((a, b) => b.at.localeCompare(a.at)), quotes };
 }
 
 /**
@@ -397,34 +476,22 @@ function norm(s: string): string {
  * counts for the session it's in.
  */
 export function verify(raw: RawFinding[], sessions: PastSession[], ids: Map<string, string>): Finding[] {
-  const said = sessions.map((s) => ({ s, words: s.prompts.map((p) => norm(p.text)) }));
-  const byId = new Map(said.map((x) => [x.s.id, x]));
+  const sources = sessions.map((s) => ({ id: s.id, at: s.at, said: s.prompts.map((p) => norm(p.text)) }));
+  const byId = new Map(sources.map((x) => [x.id, x]));
   const out: Finding[] = [];
   for (const f of raw) {
     const title = f.title?.trim();
     const body = f.body?.trim();
     if (!title || !body) continue;
-    const found = new Map<string, PastSession>();
-    const quotes: string[] = [];
-    for (const ev of f.evidence ?? []) {
-      const q = norm(ev.quote ?? "");
-      if (q.split(" ").length < 3) continue;
-      const cited = byId.get(ids.get(ev.session?.trim() ?? "") ?? "");
-      const has = (x: (typeof said)[number]) => x.words.some((w) => w.includes(q));
-      // Misfiled: the session it's really in, one not counted yet when there is one.
-      const hit = cited && has(cited) ? cited : (said.find((x) => has(x) && !found.has(x.s.id)) ?? said.find(has));
-      if (!hit) continue;
-      found.set(hit.s.id, hit.s);
-      quotes.push(ev.quote!.trim());
-    }
-    if (found.size < 2) continue;
-    const inOrder = [...found.values()].sort((a, b) => b.at.localeCompare(a.at));
+    const evidence = (f.evidence ?? []).map((ev) => ({ cited: byId.get(ids.get(ev.session?.trim() ?? "") ?? ""), quote: ev.quote }));
+    const { places, quotes } = placeQuotes(evidence, sources);
+    if (places.length < 2) continue;
     out.push({
       title: scrub(title).slice(0, 80),
       for: f.for === "you" ? "you" : "team",
       body: scrub(body),
-      sessions: inOrder.map((s) => s.id),
-      last: inOrder[0]!.at.slice(0, 10),
+      sessions: places.map((s) => s.id),
+      last: places[0]!.at.slice(0, 10),
       quotes,
     });
   }
@@ -462,10 +529,12 @@ export async function findLearnings(
   const sessions = opts.sessions ?? pastSessions(repo, opts.home);
   const base = { sessions: sessions.length, read: 0, model, findings: [] as Finding[] };
   if (sessions.length < 2) return { ...base, durationMs: Date.now() - started, reason: "no_sessions" };
-  if (!hasClaude()) return { ...base, durationMs: Date.now() - started, reason: "no_claude" };
+  const bin = claudeBin(opts.home);
+  if (!bin) return { ...base, durationMs: Date.now() - started, reason: "no_claude" };
   const { text, ids } = digest(sessions);
   base.read = ids.size;
   const asked = await askClaude(
+    bin,
     `Past sessions in this repository, newest first. Find what the person had to tell the agent more than once.\n\n${text}`,
     model,
     opts.timeoutMs ?? 180_000,
@@ -502,7 +571,7 @@ export function beginPastRead(repo: string, env: NodeJS.ProcessEnv = process.env
     if (env.TRAIL_NO_FETCH === "1" || readJson<{ at?: number }>(readMark(repo))?.at) return null;
     const sessions = pastSessions(repo);
     if (sessions.length < 2) {
-      track("cold_start", { outcome: "no_sessions", sessions_bucket: countBucket(sessions.length) }, { repo });
+      track("cold_start", { source: "sessions", outcome: "no_sessions", sessions_bucket: countBucket(sessions.length) }, { repo });
       return null;
     }
     const read: PastRead = { sessions: sessions.length, started: Date.now(), done: false, result: findLearnings(repo, { sessions }) };
@@ -534,15 +603,26 @@ export function saveFindings(repo: string, findings: Finding[], author = noteAut
   );
 }
 
-/** Wait for the read, save what it found, and remember the repo was read. */
-export async function finishPastRead(repo: string, read: PastRead): Promise<{ result: FindResult; saved: Note[] }> {
+/**
+ * Wait for the read, save the findings the person keeps, and remember the repo
+ * was read. Every finding is kept unless `keep` picks; `keep` resolving null
+ * means they cancelled, so nothing is saved and the next init asks again.
+ */
+export async function finishPastRead(
+  repo: string,
+  read: PastRead,
+  keep?: (findings: Finding[]) => Promise<Finding[] | null>,
+): Promise<{ result: FindResult; saved: Note[]; kept: Finding[]; cancelled: boolean }> {
   const result = await read.result;
-  const saved = result.findings.length ? saveFindings(repo, result.findings) : [];
-  const outcome = saved.length ? "found" : (result.reason ?? "none_found");
+  const chosen = result.findings.length && keep ? await keep(result.findings) : result.findings;
+  const kept = chosen ?? [];
+  const saved = kept.length ? saveFindings(repo, kept) : [];
+  const outcome = chosen === null ? "cancelled" : result.findings.length ? "found" : (result.reason ?? "none_found");
   if (outcome === "found" || outcome === "none_found") writeJsonAtomic(readMark(repo), { at: Date.now(), model: result.model, saved: saved.length }, true);
   track(
     "cold_start",
     {
+      source: "sessions",
       outcome,
       sessions_bucket: countBucket(result.sessions),
       offered_bucket: countBucket(result.findings.length),
@@ -552,5 +632,5 @@ export async function finishPastRead(repo: string, read: PastRead): Promise<{ re
     },
     { repo },
   );
-  return { result, saved };
+  return { result, saved, kept, cancelled: chosen === null };
 }

@@ -48,7 +48,8 @@ for (const [name, src] of [['statusline', statuslineShim()], ['hooks', hooksShim
     assert.match(src, /'package\.json'/); // versionOf reads each candidate's version
 
     // Windows-safe dynamic import + best-effort catch
-    assert.match(src, /pathToFileURL\(entry\(/);
+    assert.match(src, /const target = entry\(/);
+    assert.match(src, /pathToFileURL\(target\)/);
     assert.match(src, /\.catch\(\(\) => \{/);
   });
 }
@@ -78,8 +79,8 @@ test('the shims init commits are the same bytes on every machine', () => {
   runInit(repo, { build: false, home, global: false, brand: 'trail' });
   installCursorHooks(repo);
   const written = {
-    statusline: readFileSync(join(repo, '.claude', 'helpers', 'trail-statusline.cjs'), 'utf8'),
-    hooks: readFileSync(join(repo, '.claude', 'helpers', 'trail-hooks.cjs'), 'utf8'),
+    statusline: readFileSync(join(repo, '.trail', 'statusline.cjs'), 'utf8'),
+    hooks: readFileSync(join(repo, '.trail', 'hook.cjs'), 'utf8'),
     cursor: readFileSync(join(repo, '.cursor', 'hooks', 'graft-hooks.cjs'), 'utf8'),
   };
   assert.equal(written.statusline, statuslineShim());

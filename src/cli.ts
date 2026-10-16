@@ -27,6 +27,7 @@ import { checkoutRoot, ensureRepoHome, keepsNotes, noteCount, rememberRepo, repo
 import { brand, cmd, graftNotice, strandedRepoNotice, tag } from "./brand.js";
 import { branchDiff } from "./cloud/diff.js";
 import { openBrowser } from "./util/browser.js";
+import { learningsAtBase, teammateEdits, withBaseLearnings } from "./check/learning-edits.js";
 import { contextDirFor } from "./context/node-file.js";
 import { loadGraphCached } from "./graph/load.js";
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from "./graph/refresh.js";
@@ -45,7 +46,7 @@ import {
 import { formatInitEpilogue } from "./cli-epilogue.js";
 import { planInit, selectedWrites } from "./hosts/plan.js";
 import { planRetract, runRetract, changed, type Retraction } from "./hosts/retract.js";
-import { compactWrites, formatNonInteractiveHelp, formatPlan, runPicker } from "./cli-picker.js";
+import { compactWrites, formatNonInteractiveHelp, formatPlan, pickLearnings, runPicker } from "./cli-picker.js";
 import { buildGraphWithProgress } from "./claude/build-progress.js";
 import { homedir } from "node:os";
 import { formatUpgradeReport, formatVersionReport, getNpmViewVersion, readCurrentVersion, readPackageName, runUpgrade } from "./cli-meta.js";
@@ -54,9 +55,10 @@ import { patchBuildConfig, type BuildConfig } from "./util/state.js";
 import { normalizePathPrefix } from "./util/paths.js";
 import { latestSession, formatSessionStats, sessionInputRate } from "./claude/session-metrics.js";
 import { listSessionIds, readSession, sessionDir } from "./claude/state.js";
-import { costLabel, listNotes, noteName, notePlace, noteTargets, readingTokens, savedByNote, commitLines, PERSONAL_SAVED_LINE, SECTIONS, sectionLead, shortDate, tokensLabel, writeNote, type Note, mentionedFiles } from "./notes/notes.js";
-import { currentSessionCost } from "./notes/session-cost.js";
-import { beginPastRead, finishPastRead } from "./notes/cold-start.js";
+import { costLabel, listNotes, noteName, notePlace, noteTargets, readingTokens, savedByNote, commitLines, PERSONAL_SAVED_LINE, PR_SPEEDUP, SECTIONS, tokensWorthSaying, sectionLead, shortDate, tokensLabel, writeNote, type Note, mentionedFiles } from "./notes/notes.js";
+import { aboutTerms, currentSessionCost } from "./notes/session-cost.js";
+import { beginPastRead, finishPastRead, type Finding } from "./notes/cold-start.js";
+import { beginReviewRead, finishReviewRead, type ReviewFinding } from "./notes/pr-reviews.js";
 import { currentBranch, noteAuthor, teammatesOn } from "./notes/git-facts.js";
 import { confirm, fold, getSkill, learn, listSkills, publish, skillForAgent, skillName, skillStatus, type LearnResult } from "./skills/skills.js";
 import { clearPending, cloudLines, loginLink, sessionKey, waitForConnect } from "./cloud/nudge.js";
@@ -208,7 +210,7 @@ const DIR_ARG = ["[dir]", "repository root (default: nearest ancestor with a gra
 function queryRoot(dir?: string): string {
   if (dir !== undefined) return resolve(dir);
   const { root, levels } = nearestGraftRoot(process.cwd(), program.opts<GlobalOpts>().dir);
-  if (levels > 0) console.error(`${tag()} no graft/ here — answering from ${root}/graft`);
+  if (levels > 0) console.error(`${tag()} no code map here — answering from ${contextDirFor(root, program.opts<GlobalOpts>().dir)}`);
   return root;
 }
 
@@ -313,14 +315,16 @@ function spelling(action: Command): string {
 // Hidden: spawned detached by maybeSyncInBackground when a workspace repo's
 // learnings changed, or uses are waiting to go. Running it by hand syncs now.
 // A repo that moved from graft to trail at session start reads its past
-// sessions here, detached, so the session doesn't wait on it.
+// sessions and PR reviews here, detached, so the session doesn't wait on it.
 program
   .command("_trail-past-read", { hidden: true })
   .argument("<dir>")
   .action(async (dir: string) => {
     const repo = resolve(dir);
     const read = beginPastRead(repo);
+    const reviews = beginReviewRead(repo);
     if (read) await finishPastRead(repo, read);
+    if (reviews) await finishReviewRead(repo, reviews);
   });
 
 program
@@ -334,10 +338,10 @@ program
 // Hidden: spawned detached by maybeRefreshBranches.
 program
   .command("_trail-branches", { hidden: true })
-  .description("internal: fetch, then note which files teammates' pushed branches change and the learnings they carry")
+  .description("internal: fetch, then note which files teammates' open branches change and the learnings they carry")
   .argument("[dir]", "target repo directory", ".")
   .action((dir: string) => {
-    refreshBranches(resolve(dir));
+    refreshBranches(resolve(dir), { prs: true });
   });
 
 program
@@ -430,7 +434,7 @@ function moveHereToTrail(dir: string): void {
 grouped(program.command("build"), GROUP.setup)
   .description(
     TRAIL
-      ? "Rebuild the code map in graft/ ($0, no key). --check fails if it's stale; --deep adds LLM summaries."
+      ? "Rebuild the code map in .trail/cache/ ($0, no key). --check fails if it's stale; --deep adds LLM summaries."
       : "Build graft/ from your code — wiring graph + per-file cards ($0, no key). " +
           "Add --deep for the LLM concept map + per-symbol summaries/crux.",
   )
@@ -719,11 +723,11 @@ function pointerFile(pointer: string): string {
 }
 
 /**
- * After `ask`, under trail: which shown learnings are a teammate's, which
- * teammates' pushed branches change the files the answer points into, and the
+ * After `ask`, under trail: which shown learnings are a teammate's, and the
  * shown learnings recorded as a use, which is what the team page counts as
  * reuse. Then the background upkeep that keeps branches and the workspace
- * current. Spawns no git itself.
+ * current. Spawns no git itself. Teammates' branches come up after an edit
+ * instead, once there's a function to compare (notes/edit-overlap.ts).
  */
 function afterAsk(r: AskResult, repo: string): void {
   if (!r.notesChecked) return;
@@ -731,11 +735,6 @@ function afterAsk(r: AskResult, repo: string): void {
   maybeRefreshBranches(repo);
   const me = noteAuthor(repo);
   const files = [...new Set(r.hits.map((h) => pointerFile(h.pointer)))];
-  const overlaps = overlapsWith(repo, files, me).slice(0, 2);
-  if (overlaps.length) {
-    r.overlaps = overlaps.map((o) => formatOverlap(o));
-    if (!process.stdout.isTTY) r.overlaps.push(`${tag()} Start your reply with the overlap line${overlaps.length === 1 ? "" : "s"} above, word for word, so the user knows.`);
-  }
   const shown = r.notes ?? [];
   if (shown.length) {
     for (const h of shown) h.note.teammate = !!h.note.author && !!me && h.note.author !== me;
@@ -859,7 +858,7 @@ async function runCheckCommand(
     if (opts.json) {
       console.log(JSON.stringify({ context: r, graph: g.missing ? null : g }, null, 2));
     } else if (bothMissing) {
-      console.log(`${label}: NO GRAPH\n\nNo graft/ graph found. Run \`${cmd("graft build")}\` first.`);
+      console.log(`${label}: NO GRAPH\n\nNo code map found. Run \`${cmd("graft build")}\` first.`);
     } else {
       if (r.missing) {
         console.log(
@@ -1339,9 +1338,11 @@ async function runNoteCommand(repo: string, opts: NoteOptions): Promise<void> {
   };
   const minutes = wholeNumber(opts.minutes, "--minutes");
   const tokens = wholeNumber(opts.tokens, "--tokens");
-  // What the session spent, from the agent's own transcript when there is one;
-  // the flags win, since only the agent knows where its task began.
-  const spent = currentSessionCost(repo);
+  // What the session spent, from the agent's own transcript when there is one,
+  // counted from where the work the note names first came up; the flags win,
+  // since only the agent knows for sure where its task began.
+  const named = [...(opts.touches?.split(",").map((t) => t.trim()).filter(Boolean) ?? []), ...mentionedFiles(repo, body)];
+  const spent = currentSessionCost(repo, undefined, Date.now(), aboutTerms(body, named));
   const cost =
     minutes !== undefined || tokens !== undefined || spent
       ? { minutes: minutes ?? spent?.minutes, tokens: tokens ?? spent?.tokens }
@@ -1377,13 +1378,15 @@ async function runNoteCommand(repo: string, opts: NoteOptions): Promise<void> {
   }
   for (const n of saved) console.log(`✓ ${n.scope === "personal" ? "saved just for you" : "saved for your team"} · ${notePlace(n)}`);
   const note = saved[0]!;
+  // Name a code file if the note touches one; docs are rarely what it's about.
+  const about = touches.find((t) => !/\.(md|mdx|txt)$/i.test(t.split("#")[0]!)) ?? touches[0];
+  const first = about ? ` that touches ${basename(about.split("#")[0]!)}` : "";
   const took = costLabel(note.cost);
-  if (took) {
-    // Name a code file if the note touches one; docs are rarely what it's about.
-    const about = touches.find((t) => !/\.(md|mdx|txt)$/i.test(t.split("#")[0]!)) ?? touches[0];
-    const first = about ? ` that touches ${basename(about.split("#")[0]!)}` : "";
+  if (took && tokensWorthSaying(note.cost?.tokens)) {
     const reading = tokensLabel(readingTokens(note)).replace(" tokens", "");
     console.log(`· this ${took.replace(" to work out", " to figure out")}. the next session${first} gets it for ${reading}`);
+  } else if (note.scope !== "personal") {
+    console.log(`· the next session${first} starts from this, and gets to a PR ${PR_SPEEDUP}`);
   }
   // Learnings about the same files, from someone else: this one builds on theirs.
   const files = new Set(touches.map((t) => t.split("#")[0]));
@@ -1509,20 +1512,11 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
     const wantClaude = ids.includes("claude");
     const cliPath = fileURLToPath(import.meta.url);
 
-    // Under trail, with Claude Code picked: what the person kept telling Claude
-    // in this repo's past sessions, read while the rest of init runs and saved
-    // as learnings at the end. Once per repo, and never asked about first.
-    const pastRead = TRAIL && wantClaude ? beginPastRead(repo) : null;
-    if (pastRead) console.error(`· reading your ${pastRead.sessions} past Claude sessions here for what you keep telling Claude`);
-
-    if (children.length)
-      console.error(`· workspace: wiring ${repo} and ${children.length} child repo(s) — ${children.join(", ")}`);
-
-    // Today's output, file by file, behind --verbose. Everything else gets one
-    // line per step: the graph, then one per agent.
-    const verbose = opts.verbose === true;
     // Under trail, each repo gets its `.trail/learnings/`, committed with the
     // code, and its folder in ~/.trail for personal learnings and corrections.
+    // First, before the reads below send their first event: that makes the
+    // repo one on trail, so the event's repo id lands in `.trail/cache/` and
+    // not in a `graft/` that nothing ignores.
     const notesHome = new Map<string, { created: boolean; dir: string }>();
     if (TRAIL)
       for (const target of targets) {
@@ -1531,6 +1525,22 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
         notesHome.set(target, { created, dir: place.git ? place.checkout : place.dir });
         if (place.git) maybeRefreshBranches(place.checkout);
       }
+
+    // Under trail, with Claude Code picked: what the person kept telling Claude
+    // in this repo's past sessions, and what reviewers kept flagging on its
+    // merged PRs, read while the rest of init runs and saved as learnings at
+    // the end. Once per repo, and never asked about first.
+    const pastRead = TRAIL && wantClaude ? beginPastRead(repo) : null;
+    if (pastRead) console.error(`· reading your ${pastRead.sessions} past Claude sessions here for what you keep telling Claude`);
+    const reviewRead = TRAIL && wantClaude ? beginReviewRead(repo) : null;
+    if (reviewRead) console.error("· reading review comments on this repo's merged PRs for what reviewers keep flagging");
+
+    if (children.length)
+      console.error(`· workspace: wiring ${repo} and ${children.length} child repo(s) — ${children.join(", ")}`);
+
+    // Today's output, file by file, behind --verbose. Everything else gets one
+    // line per step: the graph, then one per agent.
+    const verbose = opts.verbose === true;
     const reports: WireReport[] = [];
     for (const target of targets) {
       if (verbose && target !== repo) console.error(`\n— ${relative(repo, target)}/`);
@@ -1575,21 +1585,75 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
       }
     }
 
-    // Under trail: what init learned from past sessions, where this repo's
-    // learnings are, and how many there already are.
+    // Under trail: what init learned from past sessions and PR reviews, where
+    // this repo's learnings are, and how many there already are.
     let learnedNow = false;
-    if (TRAIL && pastRead) {
-      if (!pastRead.done) console.error("· still reading your past sessions…");
-      const { result, saved } = await finishPastRead(repo, pastRead);
-      learnedNow = saved.length > 0;
-      if (saved.length) {
-        const n = saved.length;
-        console.error(`✓ learned ${n} thing${n === 1 ? "" : "s"} you told Claude more than once, from your last ${result.read} sessions here`);
-        for (const note of saved) console.error(`    ${note.scope === "personal" ? "just for you " : "for your team"} · ${note.title}`);
+    if (TRAIL && (pastRead || reviewRead)) {
+      if (pastRead && !pastRead.done) console.error("· still reading your past sessions…");
+      const fromSessions = pastRead ? (await pastRead.result).findings : [];
+      if (reviewRead && !reviewRead.done) console.error("· still reading PR reviews…");
+      const fromReviews = reviewRead ? (await reviewRead.result).findings : [];
+      // On a terminal, the person ticks which to keep in one list for both
+      // sources, all ticked to start; a scripted run, or one with --yes, keeps
+      // them all. Cancelling saves none, and the next init asks again.
+      const picked =
+        process.stdin.isTTY && process.stderr.isTTY && !opts.yes && fromSessions.length + fromReviews.length
+          ? await pickLearnings([
+              ...fromSessions.map((f) => ({ title: f.title, forTeam: f.for === "team", sessions: f.sessions.length })),
+              ...fromReviews.map((f) => ({ title: f.title, forTeam: true, prs: f.prs.length })),
+            ])
+          : undefined;
+      // The picked rows that are `found`'s, which start at `from` in the list.
+      const keepFrom =
+        <T>(from: number) =>
+        picked === undefined
+          ? undefined
+          : async (found: T[]) => picked && picked.filter((i) => i >= from && i < from + found.length).map((i) => found[i - from]!);
+      const learned: Note[] = [];
+      if (pastRead) {
+        const { result, saved, kept, cancelled } = await finishPastRead(repo, pastRead, keepFrom<Finding>(0));
+        const offered = result.findings.length;
+        if (saved.length) {
+          const n = saved.length;
+          const what = n < offered ? `kept ${n} of the ${offered} things` : `learned ${n} thing${n === 1 ? "" : "s"}`;
+          console.error(`✓ ${what} you told Claude more than once, from your last ${result.read} sessions here`);
+          // Each with how many sessions it was said in: saveFindings keeps the findings' order.
+          saved.forEach((note, i) => {
+            const said = kept[i]?.sessions.length ?? 0;
+            const count = said > 1 ? `told Claude in ${said} sessions: ` : "";
+            console.error(`    ${note.scope === "personal" ? "just for you " : "for your team"} · ${count}${note.title}`);
+          });
+        } else if (cancelled) {
+          console.error(`· saved none of the ${offered} things you told Claude more than once; ${cmd("graft init")} again asks again`);
+        } else if (offered) {
+          console.error(`· kept none of the ${offered} things you told Claude more than once`);
+        } else if (result.reason === "failed") {
+          console.error(`· couldn't read your past sessions this time; ${cmd("graft init")} again tries again`);
+        }
+        learned.push(...saved);
+      }
+      if (reviewRead) {
+        const { result, saved, kept, cancelled } = await finishReviewRead(repo, reviewRead, keepFrom<ReviewFinding>(fromSessions.length));
+        const offered = result.findings.length;
+        if (saved.length) {
+          const n = saved.length;
+          const what = n < offered ? `kept ${n} of the ${offered} things` : `learned ${n} thing${n === 1 ? "" : "s"}`;
+          console.error(`✓ ${what} reviewers flagged on more than one PR, from the last ${result.prs} merged PRs here`);
+          // saveReviewFindings keeps the findings' order.
+          saved.forEach((note, i) => console.error(`    for your team · flagged in review on ${kept[i]?.prs.length ?? 2} PRs: ${note.title}`));
+        } else if (cancelled) {
+          console.error(`· saved none of the ${offered} things reviewers flagged; ${cmd("graft init")} again asks again`);
+        } else if (offered) {
+          console.error(`· kept none of the ${offered} things reviewers flagged`);
+        } else if (result.reason === "failed") {
+          console.error(`· couldn't read PR reviews this time; ${cmd("graft init")} again tries again`);
+        }
+        learned.push(...saved);
+      }
+      learnedNow = learned.length > 0;
+      if (learnedNow) {
         console.error("· Claude follows them from your next session");
-        if (saved.some((s) => s.scope === "repo")) console.error(commitLines({}, teammatesOn(repo), "repo").uncommitted);
-      } else if (result.reason === "failed") {
-        console.error(`· couldn't read your past sessions this time; ${cmd("graft init")} again tries again`);
+        if (learned.some((s) => s.scope === "repo")) console.error(commitLines({}, teammatesOn(repo), "repo").uncommitted);
       }
     }
     if (TRAIL && !learnedNow) {
@@ -1606,8 +1670,11 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
       const tops: string[] = [];
       for (const w of selectedWrites(plan, ids)) {
         if (w.scope !== "repo") continue;
-        const parts = shown(repo, w.path).split("/");
-        const top = parts.length > 1 ? `${parts[0]}/` : parts[0]!;
+        const rel = shown(repo, w.path);
+        // trail's Claude Code setup shares one file in .claude/; the rest there is personal.
+        if (TRAIL && rel.startsWith(".claude/") && rel !== ".claude/settings.json") continue;
+        const parts = rel.split("/");
+        const top = TRAIL && rel === ".claude/settings.json" ? rel : parts.length > 1 ? `${parts[0]}/` : parts[0]!;
         if (!tops.includes(top)) tops.push(top);
       }
       console.error(`· restart your agents so a new session picks up ${brand()}`);
@@ -1620,8 +1687,9 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
       tops.splice(0, tops.length, ...changedTops);
       if (tops.length)
         console.error(
-          `· commit ${tops.slice(0, 5).join(" ")}${tops.length > 5 ? ` +${tops.length - 5} more` : ""} to share it — ` +
-            (TRAIL ? "teammates' Claude reads the learnings even without trail installed; the code map in graft/ stays on this machine" : "graft/ stays local and git-ignored"),
+          TRAIL
+            ? `· commit ${tops.slice(0, 5).join(" and ")}${tops.length > 5 ? ` +${tops.length - 5} more` : ""} once — after that, teammates' Claude reads your learnings even before they install trail`
+            : `· commit ${tops.slice(0, 5).join(" ")}${tops.length > 5 ? ` +${tops.length - 5} more` : ""} to share it — graft/ stays local and git-ignored`,
         );
     }
 
@@ -1701,8 +1769,10 @@ function wireTarget(
       const res = runInit(repo, { build: opts.build, cliPath, statusline: wantStatusline, global: opts.global, home, brand: brand() });
       say(`✓ wrote ${res.settingsPath}`);
       for (const s of res.shims) say(`✓ wrote ${s}`);
-      say(`✓ wrote ${res.skill}`);
-      if (res.mcp.action === "skipped-unparseable")
+      if (res.skill) say(`✓ wrote ${res.skill}`);
+      if (!res.mcp) {
+        // trail registers no server for Claude Code: the hooks and the `trail` command cover it.
+      } else if (res.mcp.action === "skipped-unparseable")
         say(`⚠ .mcp.json: ${res.mcp.path} left unchanged (not valid JSON) — add the graft server manually`);
       else if (res.mcp.action === "unchanged")
         say(`· mcp claude: ${res.mcp.path} (already registered)`);
@@ -2118,14 +2188,19 @@ async function runTeamCheck(repo: string, opts: { base?: string; json?: boolean 
     return;
   }
   const files = d.files.filter((f) => !f.startsWith(".trail/"));
-  if (files.length === 0) {
+  const me = noteAuthor(repo);
+  // Learnings this branch changed, as they were before it: the check reads those,
+  // and changing a teammate's is a finding of its own.
+  const atBase = learningsAtBase(repo, d.from, d.files);
+  const edits = teammateEdits(repo, atBase, me);
+  if (files.length === 0 && edits.length === 0) {
     console.log(`· nothing to check: no changes against ${d.base}`);
     return;
   }
   maybeRefreshBranches(repo);
   if (d.truncated) console.error("⚠ the diff is over 400 KB; only the first 400 KB is checked");
-  const me = noteAuthor(repo);
-  const r = checkLocally({ diff: withoutTrailFiles(d.diff), files, notes: listNotes(repo), skills: listSkills(repo), asker: me });
+  const r = checkLocally({ diff: withoutTrailFiles(d.diff), files, notes: withBaseLearnings(listNotes(repo), atBase), skills: listSkills(repo), asker: me });
+  r.findings.unshift(...edits);
   const sources = r.findings.map((f) => f.source).filter((s) => s.path);
   recordActivity({
     repo: repoPlace(repo).key,

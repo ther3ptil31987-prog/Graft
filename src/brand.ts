@@ -90,9 +90,11 @@ export function inBrand(text: string, b: Brand = brand()): string {
  * teammate's agent speaks the same name whichever command they installed.
  */
 export function repoWiredForTrail(dir: string): boolean {
+  if (existsSync(join(dir, ".trail", "hook.cjs"))) return true;
   if (existsSync(join(dir, ".claude", "helpers", "trail-hooks.cjs")) || existsSync(join(dir, ".claude", "skills", "trail", "SKILL.md"))) return true;
   try {
-    return readFileSync(join(dir, ".claude", "settings.json"), "utf8").includes("trail-hooks.cjs");
+    const settings = readFileSync(join(dir, ".claude", "settings.json"), "utf8");
+    return settings.includes("trail-hooks.cjs") || settings.includes("/.trail/hook.cjs");
   } catch {
     return false;
   }

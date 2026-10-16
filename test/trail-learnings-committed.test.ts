@@ -84,7 +84,7 @@ test("uncommitted team learnings are mentioned once a day, naming who'd get them
   writeFileSync(join(d, ".trail", "learnings", "x.md"), "---\ntitle: x\n---\n");
   const said = uncommittedDirective(d);
   assert.match(said, /1 team learning in \.trail\/learnings\/ isn't committed yet/);
-  assert.match(said, /🌱 Anay works in this repo\. Commit what you learned and give their agents a head start$/m);
+  assert.match(said, /🌱 Anay works in this repo\. Commit what you learned and their agents get to a PR 3x faster$/m);
   assert.equal(uncommittedDirective(d), "", "once a day");
   assert.notEqual(uncommittedDirective(d, Date.now() + 25 * 3600_000), "", "and again the next day while it's still waiting");
 });

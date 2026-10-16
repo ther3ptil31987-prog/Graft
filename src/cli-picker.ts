@@ -348,14 +348,20 @@ export async function runPicker(
   home: string,
   opts: { offerTelemetry?: boolean; title?: string | null } = {},
 ): Promise<Picked | null> {
-  let state = initialPickerState(plan, repo, home, opts);
+  const state = await drivePicker(initialPickerState(plan, repo, home, opts), opts.title);
+  return state ? { hosts: pickedHostIds(state), telemetry: pickedTelemetry(state) } : null;
+}
+
+/** Run a picker on the terminal until enter or esc: the final state, or null when cancelled. */
+async function drivePicker(initial: PickerState, title?: string | null): Promise<PickerState | null> {
+  let state = initial;
   const out = process.stderr;
   const stdin = process.stdin;
 
   let lastLines = 0;
   const draw = () => {
     if (lastLines > 0) out.write(`\x1b[${lastLines}A\x1b[0J`);
-    const text = renderPicker(state, true, { title: opts.title });
+    const text = renderPicker(state, true, { title });
     out.write(`${text}\n`);
     lastLines = text.split('\n').length;
   };
@@ -366,7 +372,7 @@ export async function runPicker(
   draw();
 
   try {
-    return await new Promise<Picked | null>((resolve) => {
+    return await new Promise<PickerState | null>((resolve) => {
       // Both listeners come off together: a leftover 'end' would otherwise fire
       // after a confirmed pick and redraw the picker over init's own output.
       const finish = (onData: (b: Buffer) => void) => {
@@ -376,7 +382,7 @@ export async function runPicker(
         // and an interactive widget left in the scrollback is noise.
         if (lastLines > 0) out.write(`\x1b[${lastLines}A\x1b[0J`);
         lastLines = 0;
-        resolve(state.aborted ? null : { hosts: pickedHostIds(state), telemetry: pickedTelemetry(state) });
+        resolve(state.aborted ? null : state);
       };
       const onData = (buf: Buffer) => {
         const keys = keysOf(buf.toString('utf8'));
@@ -399,6 +405,45 @@ export async function runPicker(
     stdin.setRawMode?.(wasRaw);
     stdin.pause();
   }
+}
+
+/** One thing `trail init` found the person kept telling Claude, or reviewers kept flagging, as the picker shows it. */
+export interface LearningChoice {
+  title: string;
+  forTeam: boolean;
+  /** Past sessions it was said in. */
+  sessions?: number;
+  /** Merged PRs reviewers flagged it on, for one from PR reviews. */
+  prs?: number;
+}
+
+/** One row per learning init found, every one ticked: the person unticks what Claude shouldn't follow. */
+export function learningsPickerState(items: LearningChoice[]): PickerState {
+  const rows: PickerRow[] = items.map((it, i) => ({
+    id: String(i),
+    label: it.title,
+    kind: 'host' as const,
+    detected: true,
+    hasGlobal: false,
+    summary: `${it.forTeam ? 'for your team' : 'just for you'} · ${it.prs ? `flagged in review on ${it.prs} PRs` : `told Claude in ${it.sessions ?? 0} sessions`}`,
+  }));
+  return { rows, cursor: 0, checked: new Set(rows.map((r) => r.id)), done: false, aborted: false };
+}
+
+/** The ticked learnings, as indexes into what was offered, in order. */
+export function keptLearnings(state: PickerState): number[] {
+  return state.rows.filter((r) => state.checked.has(r.id)).map((r) => Number(r.id));
+}
+
+/** Ask which learnings to keep: their indexes, or null when the person cancelled. */
+export async function pickLearnings(items: LearningChoice[]): Promise<number[] | null> {
+  const fromReviews = items.filter((it) => it.prs).length;
+  const title =
+    fromReviews === 0
+      ? `${brand()} init — you told Claude these more than once. Keep the ones it should follow:`
+      : `${brand()} init — ${fromReviews === items.length ? 'reviewers flagged these on more than one PR' : 'these came up more than once in your sessions and PR reviews'}. Keep the ones Claude should follow:`;
+  const state = await drivePicker(learningsPickerState(items), title);
+  return state ? keptLearnings(state) : null;
 }
 
 /**

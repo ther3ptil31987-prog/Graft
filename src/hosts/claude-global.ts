@@ -57,11 +57,13 @@ export function globalHelpersDir(home: string): string {
 export function claudeGlobalTargets(home: string, brand: Brand = 'graft'): PlannedWrite[] {
   const g = (id: string, path: string, kind: PlannedWrite['kind'], what: string): PlannedWrite =>
     ({ hostId: 'claude', id, path, scope: 'global', kind, what });
-  return [
+  const writes = [
     g('claude-global-shim', join(globalHelpersDir(home), 'graft-hooks.cjs'), 'hook', 'hooks shim (user level)'),
-    g('claude-global-hooks', join(home, '.claude', 'settings.json'), 'hook', 'SessionStart / UserPromptSubmit / PostToolUse / Stop'),
+    g('claude-global-hooks', join(home, '.claude', 'settings.json'), 'hook', 'SessionStart / UserPromptSubmit / PostToolUse / Stop / SessionEnd'),
     g('claude-global-mcp', join(home, '.claude.json'), 'mcp', `mcpServers.${brand}`),
   ];
+  // trail registers no server for Claude Code: the hooks and the `trail` command do its work.
+  return brand === 'trail' ? writes.slice(0, 2) : writes;
 }
 
 /** Merge graft's hook blocks into a settings file, preserving everything else. */
@@ -91,7 +93,8 @@ function upsertGlobalHooks(id: string, path: string, helpers: string): GlobalWri
  * action, never raised, so a bad `~/.claude.json` can't fail a `graft init`.
  */
 export function installClaudeGlobal(home: string, brand: Brand = 'graft'): GlobalWrite[] {
-  const [shim, settings, mcp] = claudeGlobalTargets(home, brand);
+  const [shim, settings] = claudeGlobalTargets(home, brand);
+  const mcp = { id: 'claude-global-mcp', path: join(home, '.claude.json') };
   const out: GlobalWrite[] = [];
 
   try {
@@ -115,22 +118,35 @@ export function installClaudeGlobal(home: string, brand: Brand = 'graft'): Globa
     }
   }
 
-  // Under trail the server is `trail`, unless graft's is already registered
-  // here: that one keeps serving every repo still wired as graft, and a trail
-  // repo turns it off for its own folder instead (see disableGraftServerIn).
+  // trail: no server, and the `trail` one an older trail registered here goes.
+  // graft's keeps serving every repo still wired as graft; a trail repo turns
+  // it off for its own folder (see disableGraftServerIn).
+  if (brand === 'trail') {
+    out.push(dropUserServer(mcp.id, mcp.path, 'trail'));
+    return out;
+  }
   try {
-    const loaded = readJsonObject(mcp.path);
-    const hasGraft = loaded !== 'unparseable' && Boolean(loaded.root.mcpServers?.graft);
-    out.push(
-      brand === 'trail' && hasGraft
-        ? { id: mcp.id, path: mcp.path, action: 'unchanged' }
-        : mergeJsonKey(mcp.id, mcp.path, 'mcpServers', serverEntry({ brand }), brand),
-    );
+    out.push(mergeJsonKey(mcp.id, mcp.path, 'mcpServers', serverEntry({ brand }), brand));
   } catch {
     out.push({ id: mcp.id, path: mcp.path, action: 'skipped-unparseable' });
   }
 
   return out;
+}
+
+/** Remove one user-scope server from `~/.claude.json`, leaving everything else. */
+function dropUserServer(id: string, path: string, name: string): GlobalWrite {
+  try {
+    const loaded = readJsonObject(path);
+    if (loaded === 'unparseable') return { id, path, action: 'skipped-unparseable' };
+    const servers = loaded.root.mcpServers;
+    if (!servers || typeof servers !== 'object' || !(name in servers)) return { id, path, action: 'unchanged' };
+    delete servers[name];
+    writeFileSync(path, `${JSON.stringify(loaded.root, null, 2)}\n`);
+    return { id, path, action: 'updated' };
+  } catch {
+    return { id, path, action: 'skipped-unparseable' };
+  }
 }
 
 /**

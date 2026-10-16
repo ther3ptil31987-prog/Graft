@@ -241,9 +241,10 @@ test('under trail, graft keeps its user-level server and is turned off only in t
   assert.deepEqual(cfg.projects['/w/trail-repo'].disabledMcpServers, ['graft']);
   assert.deepEqual(cfg.projects['/w/other'].disabledMcpServers, ['paper'], 'other folders untouched');
 
-  // A machine with no graft server gets trail's, and nothing to turn off.
+  // trail registers no server of its own, and takes back the one an older trail registered.
   const fresh = tmpRepo('cgtrailfresh');
+  writeFileSync(userMcpOf(fresh), JSON.stringify({ mcpServers: { trail: { command: 'trail', args: ['mcp'] }, paper: { command: 'paper' } } }, null, 2));
   installClaudeGlobal(fresh, 'trail');
-  assert.ok(readJson(userMcpOf(fresh)).mcpServers.trail);
+  assert.deepEqual(Object.keys(readJson(userMcpOf(fresh)).mcpServers), ['paper']);
   assert.equal(disableGraftServerIn(fresh, '/w/x').action, 'unchanged');
 });

@@ -32,9 +32,11 @@ const COMMAND = /^node\s+"([^"]+)"\s+(\S+)$/;
 export function globalCopyCovers(event: string, shim: string | undefined, home: string = homedir()): boolean {
   if (!shim) return false;
   const at = resolve(dirname(shim));
-  // Only Claude Code's repo copy: Cursor's and Codex's shims call the same
-  // entry, and Claude's ~/.claude hooks never run for them.
-  if (basename(at) !== "helpers" || basename(dirname(at)) !== ".claude") return false;
+  // Only Claude Code's repo copy, in `.claude/helpers/` or trail's `.trail/`:
+  // Cursor's and Codex's shims call the same entry, and Claude's ~/.claude
+  // hooks never run for them.
+  const repoCopy = basename(at) === ".trail" || (basename(at) === "helpers" && basename(dirname(at)) === ".claude");
+  if (!repoCopy) return false;
   const helpers = resolve(home, ".claude", "helpers");
   if (at === helpers) return false; // this is the ~/.claude copy
   let settings: { hooks?: Record<string, unknown> };

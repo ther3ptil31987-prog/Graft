@@ -41,7 +41,7 @@ export function writeOwned(id: string, path: string, content: string, mode?: num
  *  `undefined`, whose `.includes` would throw. */
 export function isGraftEntry(entry: unknown): boolean {
   const s = JSON.stringify(entry ?? '');
-  return s.includes('graft-hooks.cjs') || s.includes('trail-hooks.cjs');
+  return s.includes('graft-hooks.cjs') || s.includes('trail-hooks.cjs') || s.includes('/.trail/hook.cjs');
 }
 
 /**

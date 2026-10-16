@@ -38,7 +38,7 @@ export interface SessionState {
   /** Notes already put in front of the agent this session by the per-prompt
    * hook, by path, so each is shown once (see `notesForPrompt`). */
   injectedNotes?: string[];
-  /** Overlap lines (teammates' pushed branches on the same code) already put in front of the agent this session. */
+  /** `<branch> <function id>` pairs: a teammate's open branch on a function the agent edited, already put in front of it this session. */
   injectedOverlaps?: string[];
   /** Weak-match nudges spent this session, capped so the line stays signal.
    * Optional for the same backwards-compatibility reason as above. */

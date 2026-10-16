@@ -116,9 +116,6 @@ export interface AskResult {
   notesChecked?: boolean;
   /** One line about the notes, e.g. that this many would search better ranked. */
   notesHint?: string;
-  /** Teammates' pushed branches that change the files these results point into
-   *  (notes/branches.ts), one line each. */
-  overlaps?: string[];
   /** Token-saving estimate, set only in `--source` (retriever) mode: the whole
    * size of the distinct files these hits point into, i.e. the baseline cost of
    * reading them instead of this pack. Computed from file sizes stored at build. */
@@ -1204,7 +1201,7 @@ function lexical(
     // so a query that missed everywhere still tells the caller where to look.
     note: scored.length
       ? undefined
-      : `no matching nodes — try different words, or \`${cmd("graft build")}\` if graft/ is empty${scopesHereClause(scopes ?? [])}`,
+      : `no matching nodes — try different words, or \`${cmd("graft build")}\` if the code map is empty${scopesHereClause(scopes ?? [])}`,
   };
 }
 
@@ -1498,7 +1495,6 @@ export function formatAsk(r: AskResult): string {
       : [];
   const learned = r.notes?.length ? learningSavingsLine(r.notes) : null;
   if (learned) teamNotes.push(learned, "");
-  if (r.overlaps?.length) teamNotes.push(...r.overlaps, "");
   if (r.notesHint) teamNotes.push(r.notesHint, "");
   if (r.hits.length === 0) {
     if (r.notes?.length) return `${head}\n\n${teamNotes.join("\n").trimEnd()}\n\n${noteBlock || "no code matches."}${escalationNudge(r)}\n`;

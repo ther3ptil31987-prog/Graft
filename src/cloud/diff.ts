@@ -24,6 +24,8 @@ export function defaultBase(repo: string): string {
 
 export interface BranchDiff {
   base: string;
+  /** Where the branch left \`base\`: the commit the diff is taken from. */
+  from: string;
   diff: string;
   files: string[];
   /** The diff was longer than `maxBytes` and was cut. */
@@ -58,6 +60,7 @@ export function branchDiff(repo: string, base = defaultBase(repo), maxBytes = 40
   if (truncated) diff = Buffer.from(diff).subarray(0, maxBytes).toString("utf8");
   return {
     base,
+    from,
     diff,
     files: files.split("\n").map((f) => f.trim()).filter(Boolean),
     truncated,

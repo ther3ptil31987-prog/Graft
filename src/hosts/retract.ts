@@ -33,7 +33,7 @@ import { hookTargets } from './codex-hooks.js';
 import { cursorHookTargets } from './cursor-hooks.js';
 import { antigravitySkillTargets } from './antigravity.js';
 import { claudeGlobalTargets } from './claude-global.js';
-import { claudeTargets, claudeTargetsFor } from '../claude/init.js';
+import { claudeTargetsFor, legacyClaudeTargets, TRAIL_HOOK, TRAIL_STATUSLINE, trailSkillPath } from '../claude/init.js';
 import { isGraftAllowEntry, isGraftFooterRegex } from '../claude/settings-merge.js';
 import type { WriteScope } from './plan.js';
 import type { Brand } from '../brand.js';
@@ -238,7 +238,7 @@ function stripClaudeSettings(path: string, apply: boolean): RetractAction {
   }
   if (typeof root !== 'object' || root === null || Array.isArray(root)) return 'skipped-unparseable';
   const before = JSON.stringify(root);
-  const isGraftCmd = (v: unknown) => /(graft|trail)-statusline\.cjs/.test(JSON.stringify(v ?? ''));
+  const isGraftCmd = (v: unknown) => /(graft|trail)-statusline\.cjs|\.trail\/statusline\.cjs/.test(JSON.stringify(v ?? ''));
 
   for (const key of ['statusLine', 'subagentStatusLine']) {
     if (root[key] !== undefined && isGraftCmd(root[key])) delete root[key];
@@ -248,7 +248,7 @@ function stripClaudeSettings(path: string, apply: boolean): RetractAction {
     for (const event of Object.keys(root.hooks)) {
       const prior = root.hooks[event];
       if (!Array.isArray(prior)) continue;
-      const kept = prior.filter((e: unknown) => !/(graft|trail)-hooks\.cjs/.test(JSON.stringify(e ?? '')));
+      const kept = prior.filter((e: unknown) => !/(graft|trail)-hooks\.cjs|\/\.trail\/hook\.cjs/.test(JSON.stringify(e ?? '')));
       if (kept.length === 0) delete root.hooks[event];
       else root.hooks[event] = kept;
     }
@@ -390,7 +390,7 @@ function targets(repo: string, opts: RetractOpts): Target[] {
   }
   for (const t of mcpTargets(repo, [...exclude], { home })) keptPaths.add(t.path);
   if (exclude.has('claude')) {
-    for (const n of NAMES) for (const t of claudeTargetsFor(repo, n)) keptPaths.add(t.path);
+    for (const n of NAMES) for (const t of [...claudeTargetsFor(repo, n, home), ...legacyClaudeTargets(repo, n)]) keptPaths.add(t.path);
     for (const t of claudeGlobalTargets(home)) keptPaths.add(t.path);
   }
   if (exclude.has('agents')) for (const t of hookTargets(home)) keptPaths.add(t.path);
@@ -441,11 +441,14 @@ function targets(repo: string, opts: RetractOpts): Target[] {
 
   // 3. Claude Code: settings fragments, both shims, the skill, and the .mcp.json key.
   if (!exclude.has('claude')) {
-    const [settings, , , , mcp] = claudeTargets(repo).map((t) => t.path);
+    const [settings, , , , mcp] = legacyClaudeTargets(repo, 'graft').map((t) => t.path);
+    const local = join(repo, '.claude', 'settings.local.json');
+    const trailHook = join(repo, TRAIL_HOOK);
+    const trailSl = join(repo, TRAIL_STATUSLINE);
     // The shims and skill under both names: a repo that moved to trail's names
     // still comes out clean, and so does one a teammate on graft re-wired.
     const named = (['graft', 'trail'] as const).flatMap((n) => {
-      const [, statusline, hooks, skill] = claudeTargetsFor(repo, n).map((t) => t.path);
+      const [, statusline, hooks, skill] = legacyClaudeTargets(repo, n).map((t) => t.path);
       return [
         { hostId: 'claude', path: statusline, what: 'statusline shim', scope: 'repo', run: (a: boolean) => removeFile(statusline, a) },
         { hostId: 'claude', path: hooks, what: 'hooks shim', scope: 'repo', run: (a: boolean) => removeFile(hooks, a) },
@@ -454,6 +457,9 @@ function targets(repo: string, opts: RetractOpts): Target[] {
     });
     for (const t of [
       { hostId: 'claude', path: settings, what: 'statusline + hooks + allowlist + footer regex', scope: 'repo', run: (a) => stripClaudeSettings(settings, a) },
+      { hostId: 'claude', path: local, what: 'trail statusline + allowlist', scope: 'repo', run: (a) => stripClaudeSettings(local, a) },
+      { hostId: 'claude', path: trailHook, what: 'hooks shim', scope: 'repo', run: (a) => removeFile(trailHook, a) },
+      { hostId: 'claude', path: trailSl, what: 'statusline shim', scope: 'repo', run: (a) => removeFile(trailSl, a) },
       ...named,
       { hostId: 'claude', path: mcp, what: 'mcpServers entry', scope: 'repo', run: (a) => removeJsonKey(mcp, 'mcpServers', a) },
     ] as Target[]) add(t);
@@ -477,6 +483,7 @@ function targets(repo: string, opts: RetractOpts): Target[] {
         { hostId: 'claude', path: shim.path, what: shim.what, scope: 'global', run: (a) => removeFile(shim.path, a) },
         { hostId: 'claude', path: settings.path, what: settings.what, scope: 'global', run: (a) => stripClaudeSettings(settings.path, a) },
         { hostId: 'claude', path: mcp.path, what: mcp.what, scope: 'global', run: (a) => removeJsonKey(mcp.path, 'mcpServers', a) },
+        { hostId: 'claude', path: trailSkillPath(home), what: 'trail skill', scope: 'global', run: (a) => removeFile(trailSkillPath(home), a) },
       ] as Target[]) add(t);
     }
     if (!exclude.has('agents')) {
@@ -498,10 +505,12 @@ function targets(repo: string, opts: RetractOpts): Target[] {
   //    here can't strand the wiring half-retracted.
   if (opts.cache !== false) {
     const cache = join(repo, 'graft');
+    const trailCache = join(repo, '.trail', 'cache');
     const gitignore = join(repo, '.gitignore');
     const ignore = join(repo, '.ignore');
     for (const t of [
       { hostId: 'graph', path: cache, what: 'local graph cache', scope: 'repo', run: (a) => removeDir(cache, a) },
+      { hostId: 'graph', path: trailCache, what: 'local graph cache', scope: 'repo', run: (a) => removeDir(trailCache, a) },
       { hostId: 'graph', path: gitignore, what: 'graft/ ignore entry', scope: 'repo', run: (a) => stripIgnoreEntries(gitignore, [/^\/?graft\/?$/], a) },
       { hostId: 'graph', path: ignore, what: 'graft/ search re-admit entries', scope: 'repo', run: (a) => stripIgnoreEntries(ignore, [/^!?graft\/?$/, /^graft\/\.(cache|graph)\/?$/], a) },
     ] as Target[]) add(t);

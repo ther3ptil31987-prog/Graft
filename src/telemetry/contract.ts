@@ -78,11 +78,12 @@ export const EVENTS: Record<string, ReadonlySet<string>> = {
    *  buckets, and whether it's the clone's first look. Committed learnings
    *  are trail's activation. Paths and titles never travel. */
   learnings_committed: new Set<string>(['added_bucket', 'total_bucket', 'first_look']),
-  /** `trail init` read the repo's past Claude sessions for learnings: how it
-   *  went, how many sessions there were, findings Claude offered and trail
-   *  saved, as buckets, how long it took, and the model. The messages and the
-   *  findings never travel. */
-  cold_start: new Set<string>(['outcome', 'sessions_bucket', 'offered_bucket', 'picked_bucket', 'duration_bucket', 'model']),
+  /** `trail init` read the repo's past Claude sessions, or the review comments
+   *  on its merged PRs (`source`), for learnings: how it went, how many
+   *  sessions or reviewed PRs there were, findings Claude offered and trail
+   *  saved, as buckets, how long it took, and the model. The messages, the
+   *  comments and the findings never travel. */
+  cold_start: new Set<string>(['source', 'outcome', 'sessions_bucket', 'reviews_bucket', 'offered_bucket', 'picked_bucket', 'duration_bucket', 'model']),
   /** `trail learn` saved a correction as a takeaway on a skill (into
    *  `~/.trail/`). `new_skill` says whether it started a skill. The text never
    *  travels. */

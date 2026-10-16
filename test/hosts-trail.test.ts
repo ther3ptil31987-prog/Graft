@@ -58,11 +58,12 @@ function agentHome(): string {
   return home;
 }
 
-test('trail spelling: renamed commands, the name in prose, the code map folder kept', () => {
+test('trail spelling: renamed commands, the name in prose, the code map folder moved', () => {
   assert.equal(trailSpelling('run `graft check` in CI'), 'run `trail build --check` in CI');
   assert.equal(trailSpelling('`graft stats --json`'), '`trail status --json`');
   assert.equal(trailSpelling('`graft checkout x` and `graft ask "q"`'), '`trail checkout x` and `trail ask "q"`');
-  assert.equal(trailSpelling('## Graft — see graft/INDEX.md, graft-hooks.cjs, graft_find_code'), '## Trail — see graft/INDEX.md, graft-hooks.cjs, graft_find_code');
+  assert.equal(trailSpelling('## Graft — see graft/INDEX.md, graft-hooks.cjs, graft_find_code'), '## Trail — see .trail/cache/INDEX.md, graft-hooks.cjs, graft_find_code');
+  assert.equal(trailSpelling('`graft/` holds it, unlike .claude/skills/graft/ or @nanonets/graft/x'), '`.trail/cache/` holds it, unlike .claude/skills/graft/ or @nanonets/graft/x');
 });
 
 test('the instruction text under trail names trail commands only; under graft it is what it was', () => {
@@ -71,9 +72,9 @@ test('the instruction text under trail names trail commands only; under graft it
   assert.match(trail, /`trail ask "<your question>" --source`/);
   assert.match(trail, /`trail grep "<literal>"`/);
   assert.match(trail, /`trail callers <symbol>`/);
-  assert.match(trail, /`graft\/INDEX\.md`/, 'the code map still lives in graft/');
+  assert.match(trail, /`\.trail\/cache\/INDEX\.md`/, 'under trail the code map is in .trail/cache/');
   assert.doesNotMatch(trail, GRAFT_COMMAND);
-  assert.match(cursorRule('trail'), /^---\ndescription: Use the Trail context graph in graft\/ before exploring source\nalwaysApply: true\n---\n## Trail/);
+  assert.match(cursorRule('trail'), /^---\ndescription: Use the Trail context graph in \.trail\/cache\/ before exploring source\nalwaysApply: true\n---\n## Trail/);
   assert.equal(instructionBody('graft'), instructionBody());
   assert.match(instructionBody(), /^## Graft — repo context graph/);
 });

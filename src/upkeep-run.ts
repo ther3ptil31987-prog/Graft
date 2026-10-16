@@ -6,7 +6,7 @@
  * re-run the wiring, and it is deliberately thin.
  */
 import { spawn } from 'node:child_process';
-import { runInit } from './claude/init.js';
+import { runInit, wiringName } from './claude/init.js';
 import { runHostsInit } from './hosts/init.js';
 import { graftCliPath } from './claude/paths.js';
 import { BRAND_ENV, repoWiredForTrail, setBrand, trailOnPath } from './brand.js';
@@ -46,8 +46,9 @@ export interface UpkeepResult {
 function rewriteWiring(repo: string, hosts: string[], opts: WiringOpts, toTrail = false): void {
   // Moving to trail: everything written from here speaks trail, the repo gets
   // its .trail/, and the hosts are rewired under trail's names.
-  if (toTrail) {
-    setBrand('trail');
+  if (toTrail) setBrand('trail');
+  // Under trail, each refresh also brings `.trail/` and its README up to date.
+  if (toTrail || wiringName(repo) === 'trail') {
     const { place } = ensureRepoHome(repo);
     if (place.git) ensureRepoTrail(place.checkout);
   }

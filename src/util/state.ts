@@ -11,6 +11,7 @@
  */
 import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, isAbsolute } from 'node:path';
+import { mapDirFor } from '../context/map-dir.js';
 
 export interface Stats {
   nodeCount: number; edgeCount: number; languages: string[];
@@ -42,7 +43,7 @@ const LOCK_FILE = '.sync.lock';
  */
 export function resolveContextDir(projectDir: string): string {
   const override = process.env.GRAFT_DIR;
-  if (!override) return join(projectDir, 'graft');
+  if (!override) return mapDirFor(projectDir);
   return isAbsolute(override) ? override : join(projectDir, override);
 }
 

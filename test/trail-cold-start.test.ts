@@ -6,10 +6,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
-import { digest, ownWords, readSession, scrub, sessionFiles, verify, type PastSession } from "../src/notes/cold-start.js";
+import { basename, dirname, join } from "node:path";
+import { claudeBin, digest, finishPastRead, ownWords, readSession, scrub, sessionFiles, verify, type Finding, type FindResult, type PastSession } from "../src/notes/cold-start.js";
+import { ensureRepoHome } from "../src/notes/home.js";
 import { standingDirective } from "../src/claude/format.js";
 import { commitLines, namesLabel, parseNote, PERSONAL_SAVED_LINE, standingLearnings } from "../src/notes/notes.js";
 import { teammatesOn } from "../src/notes/git-facts.js";
@@ -124,13 +125,17 @@ test("anything like a credential or an email is scrubbed before a learning is wr
   assert.ok(!out.includes("AKIA"));
 });
 
-test("the closing lines name who works there and the head start, committed or not", () => {
+test("the closing lines name who works there and the head start, or a faster PR when it's under 80k tokens", () => {
   assert.equal(PERSONAL_SAVED_LINE, "📝 Saved just for you · stays on this machine, out of the repo");
-  const five = commitLines({ cost: { tokens: 48000 } }, ["Anay", "Rushil", "Ritika", "Rohan", "Kumar"]);
-  assert.equal(five.uncommitted, "🌱 Anay, Rushil and 3 others work in this part of the codebase. Commit what you learned and give their agents a 48k-token head start");
-  assert.equal(five.committed, "📝 Committed · Anay, Rushil and 3 others work in this part of the codebase, and their agents now get a 48k-token head start");
-  assert.equal(commitLines({}, [], "repo").uncommitted, "🌱 Commit what you learned and give your teammates' agents a head start");
-  assert.equal(commitLines({}, ["Anay"], "repo").uncommitted, "🌱 Anay works in this repo. Commit what you learned and give their agents a head start");
+  const five = commitLines({ cost: { tokens: 96000 } }, ["Anay", "Rushil", "Ritika", "Rohan", "Kumar"]);
+  assert.equal(five.uncommitted, "🌱 Anay, Rushil and 3 others work in this part of the codebase. Commit what you learned and give their agents a 96k-token head start");
+  assert.equal(five.committed, "📝 Committed · Anay, Rushil and 3 others work in this part of the codebase, and their agents now get a 96k-token head start");
+  assert.equal(commitLines({ cost: { tokens: 80_000 } }, []).uncommitted, "🌱 Commit what you learned and give your teammates' agents an 80k-token head start");
+  const small = commitLines({ cost: { tokens: 79_999 } }, ["Anay", "Rushil", "Ritika", "Rohan", "Kumar"]);
+  assert.equal(small.uncommitted, "🌱 Anay, Rushil and 3 others work in this part of the codebase. Commit what you learned and their agents get to a PR 3x faster");
+  assert.equal(small.committed, "📝 Committed · Anay, Rushil and 3 others work in this part of the codebase, and their agents now get to a PR 3x faster");
+  assert.equal(commitLines({}, [], "repo").uncommitted, "🌱 Commit what you learned and your teammates' agents get to a PR 3x faster");
+  assert.equal(commitLines({}, ["Anay"], "repo").uncommitted, "🌱 Anay works in this repo. Commit what you learned and their agents get to a PR 3x faster");
   assert.equal(namesLabel(["Anay", "Rushil", "Ritika"]), "Anay, Rushil and Ritika");
 });
 
@@ -238,9 +243,9 @@ test("trail init reads past sessions by itself and saves what came up twice, onc
   assert.equal(first.status, 0, first.err);
   assert.match(first.err, /· reading your 2 past Claude sessions here/);
   assert.match(first.err, /✓ learned 2 things you told Claude more than once, from your last 2 sessions here/);
-  assert.match(first.err, /for your team · Run go test with -race before pushing/);
-  assert.match(first.err, /just for you  · Say what you understood before building/);
-  assert.match(first.err, /· Claude follows them from your next session\n🌱 Commit what you learned and give your teammates' agents a head start/);
+  assert.match(first.err, /for your team · told Claude in 2 sessions: Run go test with -race before pushing/);
+  assert.match(first.err, /just for you  · told Claude in 2 sessions: Say what you understood before building/);
+  assert.match(first.err, /· Claude follows them from your next session\n🌱 Commit what you learned and your teammates' agents get to a PR 3x faster/);
 
   const [file] = readdirSync(join(repo, ".trail", "learnings")).filter((f) => f.endsWith(".md"));
   const team = parseNote(readFileSync(join(repo, ".trail", "learnings", file!), "utf8"), file!)!;
@@ -255,4 +260,95 @@ test("trail init reads past sessions by itself and saves what came up twice, onc
   const again = initRun(repo, home, bin);
   assert.equal(again.status, 0, again.err);
   assert.doesNotMatch(again.err, /reading your/, "read once per repo");
+});
+
+/* ---- finding Claude Code when it isn't on PATH ---- */
+
+const exe = process.platform === "win32" ? "claude.exe" : "claude";
+const extCopy = (editor: string, folder: string) => join(editor, "extensions", folder, "resources", "native-binary", exe);
+
+/** A fake home with an empty file at each of `paths`. */
+function homeWith(...paths: string[]): string {
+  const home = mkdtempSync(join(tmpdir(), "claude-bin-home-"));
+  for (const p of paths) {
+    mkdirSync(join(home, dirname(p)), { recursive: true });
+    writeFileSync(join(home, p), "");
+  }
+  return home;
+}
+
+test("claudeBin uses claude on PATH when it's there", () => {
+  assert.equal(claudeBin(homeWith(extCopy(".vscode", "anthropic.claude-code-2.1.289-darwin-arm64")), () => true), "claude");
+});
+
+test("claudeBin finds the newest VS Code or Cursor extension copy when claude isn't on PATH", () => {
+  const newest = extCopy(".cursor", "anthropic.claude-code-2.1.296-darwin-arm64");
+  const home = homeWith(
+    extCopy(".vscode", "anthropic.claude-code-2.1.99-darwin-arm64"),
+    extCopy(".vscode", "anthropic.claude-code-2.1.289-darwin-arm64"),
+    newest,
+  );
+  assert.equal(claudeBin(home, () => false), join(home, newest));
+});
+
+test("claudeBin prefers a standalone install to an extension's copy", () => {
+  const home = homeWith(join(".local", "bin", exe), extCopy(".vscode", "anthropic.claude-code-2.1.289-darwin-arm64"));
+  assert.equal(claudeBin(home, () => false), join(home, ".local", "bin", exe));
+});
+
+test("claudeBin skips an extension folder without the binary, and is null with nothing to run", () => {
+  const home = homeWith();
+  mkdirSync(join(home, ".vscode", "extensions", "anthropic.claude-code-2.1.300-darwin-arm64"), { recursive: true });
+  assert.equal(claudeBin(home, () => false), null);
+});
+
+/* ---- ticking which learnings to keep ---- */
+
+function found(title: string, forWho: "team" | "you"): Finding {
+  return { title, for: forWho, body: "## Decided\n- " + title + ".", sessions: ["a", "b", "c"], last: "2026-10-14", quotes: [] };
+}
+
+function readWith(findings: Finding[]) {
+  const result: FindResult = { sessions: 3, read: 3, findings, model: "claude-sonnet-5-5", durationMs: 10 };
+  return { sessions: 3, started: Date.now(), done: true, result: Promise.resolve(result) };
+}
+
+test("init saves only the learnings the person kept, and remembers the repo was read", async () => {
+  const home = mkdtempSync(join(tmpdir(), "keep-home-"));
+  const env = { TRAIL_HOME: process.env.TRAIL_HOME, DO_NOT_TRACK: process.env.DO_NOT_TRACK };
+  process.env.TRAIL_HOME = join(home, ".trail");
+  process.env.DO_NOT_TRACK = "1";
+  try {
+    const repo = tmpRepo("keep-some");
+    spawnSync("git", ["init", "-q"], { cwd: repo });
+    const all = [found("Use pnpm, not npm", "team"), found("Say what you understood first", "you"), found("Run go test with -race", "team")];
+    const { saved, kept, cancelled } = await finishPastRead(repo, readWith(all), async (f) => [f[0]!, f[2]!]);
+    assert.equal(cancelled, false);
+    assert.deepEqual(kept.map((f) => f.title), ["Use pnpm, not npm", "Run go test with -race"]);
+    assert.deepEqual(saved.map((n) => n.title), ["Use pnpm, not npm", "Run go test with -race"]);
+    assert.equal(readdirSync(join(repo, ".trail", "learnings")).filter((f) => f.endsWith(".md")).length, 2);
+    assert.ok(existsSync(join(ensureRepoHome(repo).place.dir, "past-sessions.json")), "read once per repo");
+  } finally {
+    process.env.TRAIL_HOME = env.TRAIL_HOME;
+    process.env.DO_NOT_TRACK = env.DO_NOT_TRACK;
+  }
+});
+
+test("cancelling the pick saves nothing, and the next init asks again", async () => {
+  const home = mkdtempSync(join(tmpdir(), "keep-none-home-"));
+  const env = { TRAIL_HOME: process.env.TRAIL_HOME, DO_NOT_TRACK: process.env.DO_NOT_TRACK };
+  process.env.TRAIL_HOME = join(home, ".trail");
+  process.env.DO_NOT_TRACK = "1";
+  try {
+    const repo = tmpRepo("keep-cancel");
+    spawnSync("git", ["init", "-q"], { cwd: repo });
+    const { saved, cancelled } = await finishPastRead(repo, readWith([found("Use pnpm, not npm", "team")]), async () => null);
+    assert.equal(cancelled, true);
+    assert.equal(saved.length, 0);
+    assert.equal(existsSync(join(repo, ".trail", "learnings")) && readdirSync(join(repo, ".trail", "learnings")).some((f) => f.endsWith(".md")), false);
+    assert.equal(existsSync(join(ensureRepoHome(repo).place.dir, "past-sessions.json")), false, "not marked read");
+  } finally {
+    process.env.TRAIL_HOME = env.TRAIL_HOME;
+    process.env.DO_NOT_TRACK = env.DO_NOT_TRACK;
+  }
 });

@@ -230,7 +230,7 @@ export function writeStamp(
  */
 export function wiredHostIds(repo: string): string[] {
   const ids: string[] = [];
-  if (['graft', 'trail'].some((n) => existsSync(join(repo, '.claude', 'helpers', `${n}-hooks.cjs`)))) ids.push('claude');
+  if (existsSync(join(repo, '.trail', 'hook.cjs')) || ['graft', 'trail'].some((n) => existsSync(join(repo, '.claude', 'helpers', `${n}-hooks.cjs`)))) ids.push('claude');
   for (const host of HOSTS) {
     // Under either name: a repo on trail has trail's files and blocks.
     const wired = (['graft', 'trail'] as const).some((n) => {
@@ -309,7 +309,7 @@ export function formatWiringRefresh(r: WiringRefresh | null): string | null {
     return (
       `[trail] graft is now trail, and this repo just moved to it: the same commands under the new name, plus learnings in .trail/learnings/ that the whole team shares. ` +
       `trail is reading the user's past Claude sessions here in the background, and what it learns is there from the next session. ` +
-      `Tell the user this once, in a line at the end of your first reply, and that committing .claude/, .mcp.json and .trail/ moves their team over too.`
+      `Tell the user this once, in a line at the end of your first reply, and that committing .trail/ and .claude/settings.json once moves their team over too.`
     );
   // Name the out-of-repo writes explicitly: those are machine-wide and shared by
   // every repo, so a user seeing this line should not have to guess what moved.

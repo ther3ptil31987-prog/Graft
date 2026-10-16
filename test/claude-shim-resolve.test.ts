@@ -199,3 +199,64 @@ test('a remembered install others can write to is ignored', {
   // pointed the file at their own code.
   assert.equal(runShim(root, project(root)), null);
 });
+
+/** Runs the hooks shim for `event` with no install anywhere, as `name`; returns what it printed. */
+function runBare(root: string, projectDir: string, event: string): string {
+  const shimPath = join(root, 'trail-hooks.cjs');
+  writeFileSync(shimPath, hooksShim());
+  const { preload, env } = isolate(root);
+  const res = spawnSync(process.execPath, ['--require', preload, shimPath, event], {
+    encoding: 'utf8',
+    env: { ...process.env, ...env, CLAUDE_PROJECT_DIR: projectDir },
+  });
+  assert.equal(res.status, 0, `shim exited ${res.status}: ${res.stderr}`);
+  return res.stdout;
+}
+
+/** A repo a teammate set trail up in, cloned by someone without trail: learnings, no install. */
+function clonedWithLearnings(root: string, me: string, authors: string[]): string {
+  const p = project(root);
+  spawnSync('git', ['init', '-q'], { cwd: p });
+  spawnSync('git', ['config', 'user.name', me], { cwd: p });
+  mkdirSync(join(p, '.trail', 'learnings'), { recursive: true });
+  authors.forEach((a, i) =>
+    writeFileSync(
+      join(p, '.trail', 'learnings', `2026-10-1${i}-retries-${a.toLowerCase()}.md`),
+      `---\ntitle: "Retries decision ${i}"\nauthor: ${a}\ndate: 2026-10-1${i}\n---\n\n## Decided\n- Keep 4.\n`,
+    ),
+  );
+  return p;
+}
+
+test('without trail anywhere, Claude credits a learning it used, and only then offers to set trail up', () => {
+  const root = tmpRepo('shim-offer');
+  const repo = clonedWithLearnings(root, 'Kumar S', ['Anirudh']);
+  const out = JSON.parse(runBare(root, repo, 'session-start'));
+  assert.equal(out.hookSpecificOutput.hookEventName, 'SessionStart');
+  const ctx: string = out.hookSpecificOutput.additionalContext;
+  assert.match(ctx, /trail isn't installed on this machine/);
+  assert.match(ctx, /- Retries decision 0 \(Anirudh\) · \.trail\/learnings\/2026-10-10-retries-anirudh\.md/);
+  assert.match(ctx, /When one of them shapes your reply, end it with one line crediting it: whose learning, what it was about, and what it let you skip/);
+  assert.match(ctx, /The first time you credit one in this session, and only then, add once, word for word: "Install trail to get this on every task, plus search and checks\. Want me to set it up\?"/);
+  assert.match(ctx, /When no learning shapes your reply, say nothing about trail\./);
+  assert.match(ctx, /Only if the user says yes, run "npm install -g @trailhq\/trail-code" and then "trail init --no-agents"/);
+  assert.match(ctx, /never edit them/);
+});
+
+test('each learning is listed with its author, newest first, so the credit can name them', () => {
+  const root = tmpRepo('shim-offer-names');
+  const repo = clonedWithLearnings(root, 'Kumar', ['Anirudh', 'Priya', 'Sam']);
+  const ctx: string = JSON.parse(runBare(root, repo, 'session-start')).hookSpecificOutput.additionalContext;
+  const sam = ctx.indexOf('Retries decision 2 (Sam)');
+  const anirudh = ctx.indexOf('Retries decision 0 (Anirudh)');
+  assert.ok(sam >= 0 && anirudh > sam, ctx);
+});
+
+test('without trail, other events and a repo with no learnings stay silent', () => {
+  const root = tmpRepo('shim-offer-quiet');
+  const repo = clonedWithLearnings(root, 'Kumar', ['Anirudh']);
+  assert.equal(runBare(root, repo, 'prompt'), '');
+  assert.equal(runBare(root, repo, 'stop'), '');
+  const empty = tmpRepo('shim-offer-empty');
+  assert.equal(runBare(empty, project(empty), 'session-start'), '');
+});

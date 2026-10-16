@@ -10,10 +10,15 @@
  * Reading branches takes git, and hooks and `ask` must not wait on it, so a
  * detached `_trail-branches` child fetches and writes what it found to a
  * cache, at most every REFRESH_MS. Everything that reads it reads the cache.
+ *
+ * A branch whose work is already on the default branch is left out: a
+ * squash-merged branch still on the remote looks unmerged to git's history,
+ * and so does one whose pull request was closed.
  */
 import { execFileSync, spawn } from "node:child_process";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { brand } from "../brand.js";
 import { graftCliPath } from "../claude/paths.js";
 import { cacheDir, readJson, writeJsonAtomic } from "../util/state.js";
 import { LEARNINGS_DIR } from "./repo-trail.js";
@@ -50,6 +55,9 @@ export interface PushedBranch {
   learnings: Array<{ name: string; text: string }>;
 }
 
+/** Branch name → the commit its merged or closed pull request ended on. */
+export type ClosedHeads = Record<string, string>;
+
 export interface BranchCache {
   /** When the refresh finished, epoch ms. */
   fetchedAt: number;
@@ -58,6 +66,8 @@ export interface BranchCache {
   /** The default branch the others are compared with, e.g. `origin/main`; null when there's no remote. */
   base: string | null;
   branches: PushedBranch[];
+  /** Branches whose pull request was merged or closed, from GitHub, kept for refreshes that don't ask it. */
+  closed?: ClosedHeads;
   /** When a refresh is running, since when. */
   runningSince?: number;
 }
@@ -112,29 +122,85 @@ function defaultRef(repo: string): string | null {
 }
 
 /**
+ * Whether merging `ref` into `base` would change nothing: everything it does
+ * is on `base` already, as after a squash merge. Needs git 2.38 for
+ * `merge-tree --write-tree`; older git, or a merge that conflicts, says no.
+ */
+export function onBase(repo: string, base: string, ref: string): boolean {
+  const merged = git(repo, ["merge-tree", "--write-tree", base, ref])?.split("\n")[0]?.trim();
+  const baseTree = git(repo, ["rev-parse", `${base}^{tree}`])?.trim();
+  return !!merged && merged === baseTree;
+}
+
+/**
+ * Branches whose GitHub pull request was merged or closed, with the commit it
+ * ended on, from `gh`. Null when origin isn't on GitHub, or gh is missing,
+ * signed out or slow: then only `onBase` decides.
+ */
+function closedPrHeads(repo: string): ClosedHeads | null {
+  const origin = git(repo, ["remote", "get-url", "origin"])?.trim() ?? "";
+  if (!/github\.com[:/]/.test(origin)) return null;
+  let out: string;
+  try {
+    out = execFileSync("gh", ["pr", "list", "--state", "all", "--limit", "200", "--json", "headRefName,headRefOid,state"], {
+      cwd: repo,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 10_000,
+      env: { ...process.env, GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
+    });
+  } catch {
+    return null;
+  }
+  try {
+    const prs = JSON.parse(out) as Array<{ headRefName?: string; headRefOid?: string; state?: string }>;
+    const open = new Set(prs.filter((p) => p.state === "OPEN").map((p) => p.headRefName));
+    const closed: ClosedHeads = {};
+    // Newest first, so a branch's latest pull request decides.
+    for (const p of prs) {
+      if (!p.headRefName || !p.headRefOid || open.has(p.headRefName) || p.headRefName in closed) continue;
+      if (p.state === "MERGED" || p.state === "CLOSED") closed[p.headRefName] = p.headRefOid;
+    }
+    return closed;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch, then read every recently pushed branch: the files it changes and the
  * learnings it adds. Writes the cache and returns it. `fetch: false` reads
  * the refs already on this machine, for tests and for a repo that's offline.
+ * `prs: true` also asks GitHub which pull requests closed, which only the
+ * detached refresh does; everything else keeps what it last learned.
+ * `closed` supplies that answer instead (tests).
  */
-export function refreshBranches(repo: string, opts: { fetch?: boolean; now?: number; fetchTimeoutMs?: number } = {}): BranchCache {
+export function refreshBranches(
+  repo: string,
+  opts: { fetch?: boolean; now?: number; fetchTimeoutMs?: number; prs?: boolean; closed?: ClosedHeads } = {},
+): BranchCache {
   const now = opts.now ?? Date.now();
   // TRAIL_NO_FETCH: tests, and anyone who'd rather fetch themselves.
-  if (opts.fetch !== false && !process.env.TRAIL_NO_FETCH) git(repo, ["fetch", "--quiet", "--prune", "origin"], opts.fetchTimeoutMs ?? 30_000);
+  const online = opts.fetch !== false && !process.env.TRAIL_NO_FETCH;
+  if (online) git(repo, ["fetch", "--quiet", "--prune", "origin"], opts.fetchTimeoutMs ?? 30_000);
+  const closed = opts.closed ?? (online && opts.prs ? closedPrHeads(repo) : null) ?? readBranchCache(repo)?.closed ?? {};
   const base = defaultRef(repo);
   const branches: PushedBranch[] = [];
   if (base) {
-    const listed = git(repo, ["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)%09%(committerdate:unix)%09%(authorname)", "refs/remotes/origin"]) ?? "";
+    const listed = git(repo, ["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)%09%(committerdate:unix)%09%(authorname)%09%(objectname)", "refs/remotes/origin"]) ?? "";
     for (const line of listed.split("\n")) {
       if (branches.length >= MAX_BRANCHES) break;
-      const [ref, unix, author] = line.split("\t");
+      const [ref, unix, author, tip] = line.split("\t");
       if (!ref || ref === base || ref === "origin/HEAD" || ref === "origin") continue;
       // A name made only of what branch names are usually made of, or the branch is skipped:
       // it reaches what the agent reads, and a cleaned-up copy would name a different branch.
       if (safeRef(ref) !== ref) continue;
       const at = Number(unix) * 1000;
       if (!Number.isFinite(at) || now - at > BRANCH_WINDOW_MS) continue;
+      // Its pull request closed on this very commit: merged or given up, either way not open work.
+      if (tip && closed[ref.replace(/^origin\//, "")] === tip) continue;
       const changed = (git(repo, ["diff", "--name-only", `${base}...${ref}`]) ?? "").split("\n").map((f) => f.trim()).filter(Boolean);
-      if (changed.length === 0) continue;
+      if (changed.length === 0 || onBase(repo, base, ref)) continue;
       const learnings: PushedBranch["learnings"] = [];
       // Only names trail itself would write: the name reaches a command the agent may run.
       const named = changed.filter((f) => f.startsWith(`${LEARNINGS_DIR}/`) && SAFE_LEARNING_NAME.test(f.slice(LEARNINGS_DIR.length + 1)));
@@ -145,7 +211,7 @@ export function refreshBranches(repo: string, opts: { fetch?: boolean; now?: num
       branches.push({ ref, author: firstName(author ?? ""), at, files: changed.slice(0, MAX_FILES), learnings });
     }
   }
-  const cache: BranchCache = { fetchedAt: Date.now(), stamp: refsStamp(repo), base, branches };
+  const cache: BranchCache = { fetchedAt: Date.now(), stamp: refsStamp(repo), base, branches, closed };
   writeJsonAtomic(cachePath(repo), cache, true);
   return cache;
 }
@@ -252,9 +318,14 @@ export function pushedWhen(at: number, now = Date.now()): string {
   return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
 }
 
-/** `● overlap · Kumar's branch kumar/jitter also changes client.go (pushed today 14:20)`. */
+/** What starts every overlap line a person sees: `🔀 trail`. */
+export function overlapMark(): string {
+  return `🔀 ${brand()}`;
+}
+
+/** `🔀 trail · Kumar's branch kumar/jitter also changes client.go (pushed today 14:20)`. */
 export function formatOverlap(o: Overlap, now = Date.now()): string {
   const branch = o.ref.replace(/^origin\//, "");
   const files = o.shared.length <= 2 ? o.shared.join(" and ") : `${o.shared.slice(0, 2).join(", ")} and ${o.shared.length - 2} more`;
-  return `● overlap · ${o.author}'s branch ${branch} also changes ${files} (pushed ${pushedWhen(o.at, now)})`;
+  return `${overlapMark()} · ${o.author}'s branch ${branch} also changes ${files} (pushed ${pushedWhen(o.at, now)})`;
 }

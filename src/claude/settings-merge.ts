@@ -3,9 +3,11 @@ import { isGraftEntry } from '../hosts/config-write.js';
 type Json = Record<string, any>;
 
 const slCmd = (name: 'graft' | 'trail' = 'graft') => `node "\${CLAUDE_PROJECT_DIR:-.}/.claude/helpers/${name}-statusline.cjs"`;
+/** trail's status line, from the shim in `.trail/` (see claude/init.ts). */
+const TRAIL_SL_CMD = 'node "${CLAUDE_PROJECT_DIR:-.}/.trail/statusline.cjs"';
 /** Stable marker for "this statusLine is Graft's", not the full command string —
  * an older shim path or a GRAFT_DIR wrapper still names this file. Either name. */
-const STATUSLINE_HELPER = /(graft|trail)-statusline\.cjs/;
+const STATUSLINE_HELPER = /(graft|trail)-statusline\.cjs|\.trail\/statusline\.cjs/;
 const FOOTER = 'graft/[\\w./-]+\\.md';
 // Every form graft is actually invoked as. 'graft:*' covers a global install;
 // the other two cover a repo working on graft itself (or any consumer running it
@@ -32,11 +34,17 @@ const REPO_HELPERS = '${CLAUDE_PROJECT_DIR:-.}/.claude/helpers';
 function hookCmd(arg: string, helpers: string = REPO_HELPERS, name: 'graft' | 'trail' = 'graft'): string {
   return `node "${helpers}/${name}-hooks.cjs" ${arg}`;
 }
+/** trail's committed hook, `.trail/hook.cjs`, run for one event. */
+export function trailHookCmd(arg: string): string {
+  return `node "\${CLAUDE_PROJECT_DIR:-.}/.trail/hook.cjs" ${arg}`;
+}
 function graftBlocks(helpers?: string, name: 'graft' | 'trail' = 'graft'): Record<string, Json[]> {
-  const hookCmd_ = (arg: string, h?: string) => hookCmd(arg, h, name);
+  return hookBlocks((arg) => hookCmd(arg, helpers, name));
+}
+function hookBlocks(hookCmd_: (arg: string) => string): Record<string, Json[]> {
   return {
     PostToolUse: [
-      { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd_('post-edit', helpers), timeout: 10000 }] },
+      { matcher: 'Write|Edit|MultiEdit', hooks: [{ type: 'command', command: hookCmd_('post-edit'), timeout: 10000 }] },
       // Score the usage mix and sum token savings. A graft retrieval (CLI `graft …`
       // via Bash, or the `graft_*` MCP tools) prints a `[graft] tokens saved ≈ N`
       // footer this hook sums into the session total; the same hook classifies
@@ -44,7 +52,7 @@ function graftBlocks(helpers?: string, name: 'graft' | 'trail' = 'graft'): Recor
       // `graft stats` and the `session_summary` graft-vs-grep ratio. Broad matcher,
       // but the handler no-ops instantly unless there is something to record, so an
       // unrelated Bash or a plain Read costs only a stdin read.
-      { matcher: 'Bash|mcp__graft__|mcp__trail__|Read|Grep|Glob', hooks: [{ type: 'command', command: hookCmd_('tool-savings', helpers), timeout: 8000 }] },
+      { matcher: 'Bash|mcp__graft__|mcp__trail__|Read|Grep|Glob', hooks: [{ type: 'command', command: hookCmd_('tool-savings'), timeout: 8000 }] },
     ],
     // Longer budget than the other hooks: its `graft ask` is a real query, and a
     // query now brings the graph up to date first (graph/refresh.ts) — usually
@@ -54,9 +62,12 @@ function graftBlocks(helpers?: string, name: 'graft' | 'trail' = 'graft'): Recor
     // this bump (8s) keeps a child that fits inside 8s. Changing the number here is
     // therefore safe on its own — but it only reaches an existing repo when someone
     // re-runs `graft init`, since that is the only caller of this function.
-    UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd_('prompt', helpers), timeout: 15000 }] }],
-    SessionStart: [{ hooks: [{ type: 'command', command: hookCmd_('session-start', helpers), timeout: 8000 }] }],
-    Stop: [{ hooks: [{ type: 'command', command: hookCmd_('stop', helpers), timeout: 8000 }] }],
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command: hookCmd_('prompt'), timeout: 15000 }] }],
+    SessionStart: [{ hooks: [{ type: 'command', command: hookCmd_('session-start'), timeout: 8000 }] }],
+    Stop: [{ hooks: [{ type: 'command', command: hookCmd_('stop'), timeout: 8000 }] }],
+    // Sends the telemetry queue in a detached child, so closing Claude isn't
+    // slowed. Not fired when the terminal is killed; session start sends what's left.
+    SessionEnd: [{ hooks: [{ type: 'command', command: hookCmd_('session-end'), timeout: 5000 }] }],
   };
 }
 /**
@@ -182,4 +193,81 @@ export function mergeGraftHooks(existing: Json, helpers: string): { merged: Json
     merged.hooks[event] = [...foreign, ...blocks];
   }
   return { merged };
+}
+
+/** Drop every fragment graft or trail wrote from a settings object, keeping the user's. */
+function withoutOurs(existing: Json): Json {
+  const merged: Json = { ...(existing ?? {}) };
+  for (const key of ['statusLine', 'subagentStatusLine'] as const) if (isGraftStatusline(merged[key])) delete merged[key];
+  if (merged.hooks && typeof merged.hooks === 'object' && !Array.isArray(merged.hooks)) {
+    const hooks: Json = {};
+    for (const [event, prior] of Object.entries(merged.hooks)) {
+      const kept = Array.isArray(prior) ? prior.filter((e: Json) => !isGraftEntry(e)) : prior;
+      if (!Array.isArray(kept) || kept.length) hooks[event] = kept;
+    }
+    if (Object.keys(hooks).length) merged.hooks = hooks;
+    else delete merged.hooks;
+  }
+  if (Array.isArray(merged.footerLinksRegexes)) {
+    const kept = merged.footerLinksRegexes.filter((r: unknown) => !isGraftFooterRegex(r));
+    if (kept.length) merged.footerLinksRegexes = kept;
+    else delete merged.footerLinksRegexes;
+  }
+  if (merged.permissions && typeof merged.permissions === 'object' && Array.isArray(merged.permissions.allow)) {
+    const allow = merged.permissions.allow.filter((e: unknown) => !isGraftAllowEntry(e));
+    const permissions: Json = { ...merged.permissions };
+    if (allow.length) permissions.allow = allow;
+    else delete permissions.allow;
+    if (Object.keys(permissions).length) merged.permissions = permissions;
+    else delete merged.permissions;
+  }
+  return merged;
+}
+
+/**
+ * trail's part of the committed `.claude/settings.json`: one SessionStart entry
+ * running `.trail/hook.cjs`, and nothing else. For a teammate without trail it
+ * shows the learnings and offers trail; with trail it hands off to the install.
+ * Anything an older init put here (status line, the other hooks, allowlist,
+ * footer regex) comes out, so the file a team commits is the same on every machine.
+ */
+export function mergeTrailShared(existing: Json): Json {
+  const merged = withoutOurs(existing);
+  merged.hooks = { ...(merged.hooks ?? {}) };
+  merged.hooks.SessionStart = [
+    ...(Array.isArray(merged.hooks.SessionStart) ? merged.hooks.SessionStart : []),
+    { hooks: [{ type: 'command', command: trailHookCmd('session-start'), timeout: 8000 }] },
+  ];
+  return merged;
+}
+
+/**
+ * trail's part of `.claude/settings.local.json`, the person's own: the status
+ * line, the footer regex and the allowlist, plus, when `~/.claude` doesn't carry
+ * them (`--no-global`), the hooks for every event but session start, which the
+ * shared file already runs once.
+ */
+export function mergeTrailLocal(
+  existing: Json,
+  opts: { statusline?: boolean; hooks?: boolean } = {},
+): { merged: Json; warnings: string[] } {
+  const merged = withoutOurs(existing);
+  const warnings: string[] = [];
+  if (statuslineWanted(opts)) {
+    for (const key of ['statusLine', 'subagentStatusLine'] as const) {
+      if (!merged[key]) merged[key] = { type: 'command', command: TRAIL_SL_CMD };
+      else if (key === 'statusLine') warnings.push('Existing statusLine left untouched (a session allows only one). To use Trail, point it at .trail/statusline.cjs.');
+    }
+  }
+  if (opts.hooks) {
+    merged.hooks = { ...(merged.hooks ?? {}) };
+    for (const [event, blocks] of Object.entries(hookBlocks(trailHookCmd))) {
+      if (event === 'SessionStart') continue;
+      merged.hooks[event] = [...(Array.isArray(merged.hooks[event]) ? merged.hooks[event] : []), ...blocks];
+    }
+  }
+  merged.footerLinksRegexes = [...(merged.footerLinksRegexes ?? []), FOOTER];
+  merged.permissions = { ...(merged.permissions ?? {}) };
+  merged.permissions.allow = [...(merged.permissions.allow ?? []), ...ALLOW_ENTRIES];
+  return { merged, warnings };
 }

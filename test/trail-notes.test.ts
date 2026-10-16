@@ -23,7 +23,7 @@ import {
   writeNote,
   type Note,
 } from "../src/notes/notes.js";
-import { costFromTranscript } from "../src/notes/session-cost.js";
+import { aboutTerms, costFromTranscript, FALLBACK_ACTIVE_MS } from "../src/notes/session-cost.js";
 import { ensureRepoHome, repoPlace } from "../src/notes/home.js";
 import { homeEnv, tmpRepo } from "./helpers.js";
 
@@ -198,6 +198,51 @@ test("the cost carries the files the session edited since its last note, for the
   ]);
 });
 
+test("a note names its work by its files and specific backticked terms, not by phrases", () => {
+  const body = "## Decided\n- `dropHtmlComments` in `src/notes/pr-reviews.ts` repeats until stable.\n- Run `trail init` and `publish`, keep `repo_id`, see `git check-ignore`.\n- `main` is fine.";
+  assert.deepEqual(aboutTerms(body, ["internal/ocr/bbox.go#NormalizeBox"]), [
+    "internal/ocr/bbox.go",
+    "bbox.go",
+    "dropHtmlComments",
+    "src/notes/pr-reviews.ts",
+    "repo_id",
+  ]);
+});
+
+test("a note's cost starts at the turn where its work first came up, not at the session's start", () => {
+  const t = [
+    // An hour on something else first.
+    line({ type: "user", timestamp: at(0), message: { content: "search slack for the release" } }),
+    line({ type: "assistant", timestamp: at(5), message: { id: "s", usage: usage(0, 50_000, 1000), content: [{ type: "tool_use", id: "x", name: "Bash", input: { command: "slack search release" } }] } }),
+    line({ type: "assistant", timestamp: at(9), message: { id: "s2", usage: usage(0, 40_000, 1000), content: [] } }),
+    // The turn the learning is about: its prompt counts, then the tool call that names the file.
+    line({ type: "user", timestamp: at(10), message: { content: "why is the box rotated?" } }),
+    line({ type: "assistant", timestamp: at(11), message: { id: "w", usage: usage(0, 3000, 500), content: [{ type: "tool_use", id: "r", name: "Read", input: { file_path: "/repo/internal/ocr/bbox.go" } }] } }),
+    line({ type: "assistant", timestamp: at(14), message: { id: "w2", usage: usage(0, 2000, 500), content: [] } }),
+    // The note being saved names everything: it never counts as where the work began.
+    line({ type: "assistant", timestamp: at(15), message: { id: "n", usage: usage(0, 0, 100), content: [{ type: "tool_use", id: "n1", name: "Bash", input: { command: "trail note --title x <<'EOF'\nslack bbox.go\nEOF" } }] } }),
+  ].join("\n");
+  const now = Date.parse(at(15));
+  const whole = costFromTranscript(t, now)!;
+  const scoped = costFromTranscript(t, now, aboutTerms("see `internal/ocr/bbox.go`"))!;
+  assert.equal(whole.tokens, 51_000 + 41_000 + 3500 + 2500 + 100);
+  assert.equal(scoped.tokens, 3500 + 2500 + 100);
+  assert.equal(scoped.minutes, 5);
+  assert.equal(scoped.countedFrom, Date.parse(at(10)));
+  assert.equal(scoped.startedAt, Date.parse(at(0)), "the stretch since the last note still starts at the top");
+});
+
+test("when nothing in the transcript names the work, only the last 30 active minutes count", () => {
+  const t = Array.from({ length: 13 }, (_, i) =>
+    line({ type: "assistant", timestamp: at(i * 5), message: { id: `m${i}`, usage: usage(0, 1000, 0), content: [] } }),
+  ).join("\n");
+  const now = Date.parse(at(60));
+  assert.equal(costFromTranscript(t, now)!.minutes, 60);
+  const capped = costFromTranscript(t, now, ["nowhere/in/it.go"])!;
+  assert.equal(capped.minutes, FALLBACK_ACTIVE_MS / 60_000);
+  assert.equal(capped.tokens, 7000, "the entries at 30, 35, …, 60 minutes");
+});
+
 test("no transcript entries, no cost", () => {
   assert.equal(costFromTranscript("", Date.now()), null);
   assert.equal(costFromTranscript("not json\n", Date.now()), null);
@@ -241,7 +286,7 @@ test("trail init makes the repo's .trail/learnings/ and says to commit it; graft
   const t = run("trail", ["init", d, "--agents", "claude", "--yes", "--no-global"], home);
   assert.equal(t.status, 0, t.err);
   assert.match(t.err, /✓ learnings {2}\.trail\/learnings\/ · sessions that take real digging leave one there, for your whole team/);
-  assert.match(t.err, /· commit .*\.trail\/ to share it/);
+  assert.match(t.err, /· commit \.claude\/settings\.json and \.trail\/ once — after that, teammates' Claude reads your learnings even before they install trail/);
   assert.ok(existsSync(join(d, ".trail", "learnings")));
   assert.match(readFileSync(join(d, ".trail", "README.md"), "utf8"), /^# \.trail/);
   assert.equal(readFileSync(join(d, "CLAUDE.md"), "utf8"), "# extract\n\nTeam rules.\n", "the team's CLAUDE.md is untouched");
@@ -268,14 +313,14 @@ test("trail note saves a learning in .trail/learnings/ to commit, ask shows it t
   const saved = run("trail", ["note", d, "--title", "Bbox coordinates are off on rotated PDFs", "--minutes", "12", "--tokens", "9600"], home, BODY);
   assert.equal(saved.status, 0, saved.err);
   assert.match(saved.out, /^✓ saved for your team · \.trail\/learnings\/\d{4}-\d{2}-\d{2}-bbox-coordinates-are-off-on-rotated-priya\.md$/m);
-  assert.match(saved.out, /this took 12 min and ~9\.6k tokens to figure out\. the next session that touches bbox\.go gets it for ~\d+/);
+  assert.match(saved.out, /· the next session that touches bbox\.go starts from this, and gets to a PR 3x faster/);
   assert.match(
     saved.out,
-    /^🌱 Anay works in this part of the codebase\. Commit what you learned and give their agents a 9\.6k-token head start · git add \.trail\/learnings\/\S+\.md$/m,
+    /^🌱 Anay works in this part of the codebase\. Commit what you learned and their agents get to a PR 3x faster · git add \.trail\/learnings\/\S+\.md$/m,
   );
   assert.match(
     saved.out,
-    /\[trail\] Close your reply with one line, word for word\. If this learning is committed by the end of your turn: 📝 Committed · Anay works in this part of the codebase, and their agents now get a 9\.6k-token head start\n  If it isn't: 🌱 Anay works in this part of the codebase\. Commit what you learned and give their agents a 9\.6k-token head start$/m,
+    /\[trail\] Close your reply with one line, word for word\. If this learning is committed by the end of your turn: 📝 Committed · Anay works in this part of the codebase, and their agents now get to a PR 3x faster\n  If it isn't: 🌱 Anay works in this part of the codebase\. Commit what you learned and their agents get to a PR 3x faster$/m,
     "the closing lines, for the agent's reply",
   );
   const [file] = readdirSync(join(d, ".trail", "learnings")).filter((f) => f.endsWith(".md"));
@@ -292,7 +337,7 @@ test("trail note saves a learning in .trail/learnings/ to commit, ask shows it t
     assert.match(ask.out, /from Priya's learning · \w{3} \d+ · Bbox coordinates are off on rotated PDFs/);
     assert.match(ask.out, /ruled out {3}Rotating the image before OCR/);
     assert.match(ask.out, /\.trail\/learnings\/\d{4}-\d{2}-\d{2}-bbox/);
-    assert.match(ask.out, /\[(trail|graft)\] learnings saved ≈ [\d,]+ tokens/, "what reusing it saved, for the tally");
+    assert.match(ask.out, /\[(trail|graft)\] starting from this learning gets you to a PR 3x faster\./, "what reusing it is worth");
   }
   // Not connected to a workspace: what was searched stays unrecorded, so a later sign-in has nothing old to send.
   assert.equal(existsSync(join(home, ".trail", "outbox.jsonl")), false, "no outbox before connecting");
@@ -328,7 +373,7 @@ test("trail note without a body says how to write one", () => {
 
 // --- what agents read in a repo that uses trail ---
 
-test("the skill speaks trail in a repo wired for it, keeps graft/ paths, and teaches learnings", async () => {
+test("the skill speaks trail in a repo wired for it, names the map in .trail/cache/, and teaches learnings", async () => {
   const { skillTemplate } = await import("../src/claude/skill-template.js");
   const graft = skillTemplate("graft");
   const trail = skillTemplate("trail");
@@ -337,7 +382,7 @@ test("the skill speaks trail in a repo wired for it, keeps graft/ paths, and tea
   assert.match(trail, /^name: trail$/m, "it lives in .claude/skills/trail/");
   assert.match(trail, /`trail ask "<question>" --source`/);
   assert.match(trail, /`trail build` \/ `trail build --check`/);
-  assert.match(trail, /`graft\/` holds a graph/, "the code map folder is still graft/");
+  assert.match(trail, /`\.trail\/cache\/` holds a graph/, "under trail the code map is in .trail/cache/");
   assert.doesNotMatch(trail, /\bgraft (ask|grep|skeleton|callers|map|build|check)\b/);
   assert.match(trail, /trail note --title/);
   assert.match(trail, /It's written to `\.trail\/learnings\/`\. Commit it\n  with the change it came from/);
@@ -372,7 +417,7 @@ test("the session-start directive mentions learnings only in a repo that keeps t
   assert.doesNotMatch(formatOrientation("# map", 100), /learning/);
   const some = formatOrientation("# map", 100, undefined, 3, true);
   assert.match(some, /This repo has 3 learnings from past sessions/);
-  assert.match(some, /📝 Started from Priya's learning · saved ~9k tokens/, "the closing line, by example");
+  assert.match(some, /📝 Started from Priya's learning · saved ~90k tokens and ~12 min, or · 3x faster to a PR when that's what it prints/, "the closing line, by example");
   assert.match(some, /save a learning for the next session/);
   assert.match(some, /commit it with the change/);
   const none = formatOrientation("# map", 100, undefined, 0, true);
@@ -421,25 +466,37 @@ test("trail init moves a graft-wired repo to trail's names, and uninstall takes 
 
     const t = run("trail", ["init", d, "--agents", "claude", "--yes", "--no-global"], home);
     assert.equal(t.status, 0, t.err);
-    for (const f of ["helpers/trail-hooks.cjs", "helpers/trail-statusline.cjs", "skills/trail/SKILL.md"]) assert.ok(existsSync(join(d, ".claude", f)), f);
-    for (const f of ["helpers/graft-hooks.cjs", "helpers/graft-statusline.cjs", "skills/graft"]) assert.equal(existsSync(join(d, ".claude", f)), false, f);
-    const settings = readFileSync(join(d, ".claude", "settings.json"), "utf8");
-    assert.match(settings, /trail-hooks\.cjs\\" session-start/);
-    assert.doesNotMatch(settings, /graft-hooks\.cjs/);
-    assert.match(settings, /trail-statusline\.cjs/);
-    const mcp = JSON.parse(readFileSync(join(d, ".mcp.json"), "utf8"));
-    assert.deepEqual(Object.keys(mcp.mcpServers), ["trail"]);
-    assert.deepEqual(mcp.mcpServers.trail, { command: "npx", args: ["-y", "@trailhq/trail-code", "mcp"] });
+    // Shared: the hook in .trail/ and one SessionStart entry. The old layout is gone.
+    for (const f of [".trail/hook.cjs", ".trail/statusline.cjs"]) assert.ok(existsSync(join(d, f)), f);
+    for (const f of ["helpers", "skills/graft", "skills/trail"]) assert.equal(existsSync(join(d, ".claude", f)), false, f);
+    const settings = JSON.parse(readFileSync(join(d, ".claude", "settings.json"), "utf8"));
+    assert.deepEqual(Object.keys(settings.hooks), ["SessionStart"]);
+    assert.match(JSON.stringify(settings.hooks.SessionStart), /\/\.trail\/hook\.cjs\\" session-start/);
+    for (const k of ["statusLine", "permissions", "footerLinksRegexes"]) assert.equal(settings[k], undefined, k);
+    // Personal: status line, allowlist, and under --no-global every other hook, never session start.
+    const local = JSON.parse(readFileSync(join(d, ".claude", "settings.local.json"), "utf8"));
+    assert.match(local.statusLine.command, /\.trail\/statusline\.cjs/);
+    assert.ok(local.permissions.allow.includes("Bash(trail:*)"));
+    assert.equal(local.hooks.SessionStart, undefined);
+    assert.match(JSON.stringify(local.hooks.UserPromptSubmit), /\.trail\/hook\.cjs\\" prompt/);
+    assert.match(JSON.stringify(local.hooks.SessionEnd), /\.trail\/hook\.cjs\\" session-end/);
+    // No MCP server for Claude Code: graft's .mcp.json had only graft's, so it goes.
+    assert.equal(existsSync(join(d, ".mcp.json")), false);
+    // Nothing personal shows in git, and .gitignore is untouched by the setup.
+    assert.match(readFileSync(join(d, ".trail", ".gitignore"), "utf8"), /^statusline\.cjs$/m);
+    for (const f of [".claude/settings.local.json", ".trail/statusline.cjs"]) assert.equal(spawnSync("git", ["check-ignore", "-q", f], { cwd: d }).status, 0, f);
 
     // Running it again changes nothing.
+    const before = [".claude/settings.json", ".claude/settings.local.json"].map((f) => readFileSync(join(d, f), "utf8"));
     const again = run("trail", ["init", d, "--agents", "claude", "--yes", "--no-global"], home);
     assert.equal(again.status, 0, again.err);
-    assert.deepEqual(Object.keys(JSON.parse(readFileSync(join(d, ".mcp.json"), "utf8")).mcpServers), ["trail"]);
+    assert.deepEqual([".claude/settings.json", ".claude/settings.local.json"].map((f) => readFileSync(join(d, f), "utf8")), before);
 
     const un = run("trail", ["uninstall", d, "-y", "--no-global"], home);
     assert.equal(un.status, 0, un.err);
-    for (const f of ["helpers/trail-hooks.cjs", "skills/trail/SKILL.md"]) assert.equal(existsSync(join(d, ".claude", f)), false, f);
-    assert.equal(existsSync(join(d, ".mcp.json")), false);
+    for (const f of [".trail/hook.cjs", ".trail/statusline.cjs"]) assert.equal(existsSync(join(d, f)), false, f);
+    // Both held only what init wrote, so they go with it.
+    for (const f of ["settings.json", "settings.local.json"]) assert.equal(existsSync(join(d, ".claude", f)), false, f);
   } finally {
     delete process.env.GRAFT_MCP_NPX;
   }
