@@ -46,14 +46,18 @@ export function ownPath(p: string): boolean {
 /**
  * Files this session changed: uncommitted changes, plus files in commits made
  * since `since` (epoch ms). At most `limit`, in the order git lists them.
+ * `uncommitted: false` leaves the working tree out, for when the session's own
+ * transcript already says which files it changed: uncommitted files from
+ * before the session (an untracked token file, a stray AGENTS.md) were
+ * otherwise listed on every learning saved there.
  */
-export function changedFiles(repo: string, since?: number, limit = 10): string[] {
+export function changedFiles(repo: string, since?: number, limit = 10, uncommitted = true): string[] {
   const out: string[] = [];
   const add = (p: string) => {
     const f = p.trim();
     if (f && !ownPath(f) && !out.includes(f)) out.push(f);
   };
-  const status = git(repo, ["status", "--porcelain", "--untracked-files=all"], true);
+  const status = uncommitted ? git(repo, ["status", "--porcelain", "--untracked-files=all"], true) : null;
   for (const line of (status ?? "").split("\n")) {
     if (!line.trim()) continue;
     // `XY path` or `XY old -> new`: the path now.

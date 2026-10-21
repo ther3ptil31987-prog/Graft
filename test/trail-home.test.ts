@@ -250,6 +250,19 @@ test("saved from a folder of repos, a note goes to the repos the session changed
   assert.deepEqual(noteTargets(quiet), [{ dir: quiet, touches: [] }]);
 });
 
+test("with the session's transcript, a note lists what the session touched, not what was lying around", () => {
+  home();
+  const d = repo("touch-session", "git@github.com:acme/t.git", { "src/a.ts": "a\n", "src/b.ts": "b\n" });
+  writeFileSync(join(d, "AGENTS.md"), "stray, untracked before the session\n");
+  writeFileSync(join(d, "src", "a.ts"), "a changed\n");
+  const [t] = noteTargets(d, [join(d, "src", "a.ts")], undefined, { read: [join(d, "src", "b.ts"), join(d, "src", "a.ts"), join(homedir(), ".claude", "x.md")] });
+  assert.deepEqual(t, { dir: d, touches: ["src/a.ts"], read: ["src/b.ts"] });
+  // A session that only read still says what it read.
+  assert.deepEqual(noteTargets(d, [], undefined, { read: [join(d, "src", "b.ts")] }), [{ dir: d, touches: [], read: ["src/b.ts"] }]);
+  // Without a transcript, the working tree is still the best guess.
+  assert.deepEqual(noteTargets(d)[0]!.touches.sort(), ["AGENTS.md", "src/a.ts"]);
+});
+
 test("a session that edited a repo through both its checkout and a worktree leaves one note", () => {
   home();
   const main = repo("both-main", "git@github.com:acme/both.git", { "a.go": "package a\n", "b.go": "package b\n" });

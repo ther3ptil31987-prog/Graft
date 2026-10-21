@@ -34,6 +34,8 @@ export interface SessionCost {
   countedFrom: number;
   /** Files the agent edited or wrote in that stretch, absolute, in order. */
   edited: string[];
+  /** Files the agent opened with Read in that stretch, absolute, in order. */
+  read: string[];
 }
 
 const IDLE_MS = 10 * 60 * 1000;
@@ -239,15 +241,18 @@ export function costFromTranscript(text: string, now = Date.now(), terms?: strin
     tokens += (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0);
   }
   const edited: string[] = [];
+  const read: string[] = [];
   for (const e of after) {
     for (const b of blocks(e)) {
-      if (b.type !== "tool_use" || !EDIT_TOOLS.has(String(b.name))) continue;
+      if (b.type !== "tool_use") continue;
       const input = (b.input ?? {}) as { file_path?: unknown; notebook_path?: unknown };
       const file = typeof input.file_path === "string" ? input.file_path : input.notebook_path;
-      if (typeof file === "string" && file && !edited.includes(file)) edited.push(file);
+      if (typeof file !== "string" || !file) continue;
+      if (EDIT_TOOLS.has(String(b.name)) && !edited.includes(file)) edited.push(file);
+      else if (b.name === "Read" && !read.includes(file)) read.push(file);
     }
   }
-  return { minutes: Math.max(1, Math.round(activeMs / 60_000)), tokens, startedAt, countedFrom: times[0]!, edited };
+  return { minutes: Math.max(1, Math.round(activeMs / 60_000)), tokens, startedAt, countedFrom: times[0]!, edited, read };
 }
 
 /** The entries in the last `budgetMs` of active time before `now`, oldest first. */

@@ -15,6 +15,7 @@ import { withSavings, setInputRate } from '../context/savings.js';
 import { sessionInputRate } from '../claude/session-metrics.js';
 import { grepGraph } from '../search/grep.js';
 import { formatGrepResult, zeroHitNote } from '../search/grep-cli.js';
+import { ignoredCode } from '../search/ignored-code.js';
 import { buildRepoMap, formatRepoMap } from '../graph/map.js';
 import {
   federateAsk,
@@ -314,7 +315,7 @@ async function callSingleTool(
           fixed: typeof args.fixed === 'boolean' ? args.fixed : undefined,
           in: typeof args.in === 'string' && args.in ? args.in : undefined,
         });
-        if (result.totalHits === 0) return { text: zeroHitNote(result), isError: false };
+        if (result.totalHits === 0) return { text: zeroHitNote(result, ignoredCode(root)), isError: false };
         return { text: formatGrepResult(result), isError: false };
       }
       case 'graft_repo_map': {

@@ -26,6 +26,19 @@ test('a turn of real digging with no note wants one', () => {
   assert.equal(turnWantsNote('not json\n'), false);
 });
 
+test('an exploratory turn trail answered in one call still wants a note when the answer stood in for real reading', () => {
+  const answered = (text: string) => ({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: [{ type: 'text', text }] }] } });
+  const ask = (footer: string) => [prompt('how does checkout pick a carrier'), call('trail ask "carrier" --source'), answered(`${footer}\n\n1. pickCarrier · function`)];
+  assert.equal(turnWantsNote(jsonl(ask('[trail] tokens saved ≈ 42,739 (98%)'))), true);
+  assert.equal(turnWantsNote(jsonl(ask('[trail] tokens saved ≈ 4,200 (61%)'))), false, 'a small lookup is not digging');
+  assert.equal(turnWantsNote(jsonl(ask('[trail] learnings saved ≈ 900,000 tokens'))), false, "a reused learning's digging was done before");
+  assert.equal(
+    turnWantsNote(jsonl([...ask('[trail] tokens saved ≈ 42,739 (98%)'), prompt('thanks'), call('ls'), result()])),
+    false,
+    'only the last turn counts',
+  );
+});
+
 async function stop(input: object): Promise<string> {
   let out = '';
   const write = process.stdout.write.bind(process.stdout);

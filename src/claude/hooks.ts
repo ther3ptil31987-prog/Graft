@@ -3,8 +3,8 @@ import { execFileSync, spawn } from 'node:child_process';
 import { join, basename, isAbsolute, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readWiring } from './stats.js';
-import { formatBlastRadius, relevantRetrieval, formatOrientation, notesForPrompt, standingDirective } from './format.js';
-import { commitLines, setupCommitLine, standingLearnings } from '../notes/notes.js';
+import { formatBlastRadius, relevantRetrieval, formatOrientation, notesForPrompt, notesOnTouch, standingDirective, type Touch } from './format.js';
+import { commitLines, listNotes, setupCommitLine, standingLearnings } from '../notes/notes.js';
 import { noteAuthor, teammatesOn } from '../notes/git-facts.js';
 import { indexFreshness, staleBanner } from '../context/check.js';
 import { patchStats, readStats, acquireLock, readSession, writeSession, resolveContextDir } from './state.js';
@@ -16,7 +16,7 @@ import { flushClosedSessions, summarizeSession } from '../telemetry/sessions.js'
 import { maybeFlushInBackground } from '../telemetry/flush.js';
 import { hasSavingsTally, lastAssistantTurn, lastTurnBilling } from './tally.js';
 import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
-import { classifyToolUse, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
+import { classifyToolUse, commandInvokesGraft, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
 import { adoptRepoBrand, brand, cmd, commandOnPath, repoWiredForTrail, tag, trailHandoverLine, trailOnPath } from '../brand.js';
 import { fitTrailServerToMachine } from '../hosts/claude-global.js';
 import { globalCopyCovers } from './hook-layers.js';
@@ -207,6 +207,8 @@ async function handlePostEdit(input: any, dir: string): Promise<void> {
   if (w) { const br = formatBlastRadius(w, file); if (br) out.push(br); }
   const overlap = await editOverlap(input, dir, file);
   if (overlap) out.push(overlap);
+  const learned = learningsOnTouch(input, dir);
+  if (learned) out.push(learned);
   // One hook, one answer: two JSON objects on stdout would be read as neither.
   if (out.length) emit('PostToolUse', out.join('\n\n'));
 }
@@ -306,6 +308,40 @@ export function lastFileScopeHint(dir: string, lastFile: string | null | undefin
 function handleToolUse(input: any, dir: string): void {
   recordToolUse(dir, input?.session_id || 'default',
     { ...classifyAndScore(input?.tool_name, input?.tool_input?.command, () => input?.tool_response ?? input), host: 'claude-code' });
+  const learned = learningsOnTouch(input, dir);
+  if (learned) emit('PostToolUse', learned);
+}
+
+/**
+ * Under trail, the learnings about the file a Read, Edit or Write just touched,
+ * or that a shell command (`sed -n 1,40p src/a.ts`, `cat`, a test run) names,
+ * each once a session. A trail command is skipped: its own output already
+ * carries the learnings that bear on it. Never throws.
+ */
+export function learningsOnTouch(input: any, dir: string): string | null {
+  try {
+    if (brand() !== 'trail' || !keepsNotes(dir)) return null;
+    const ti = input?.tool_input ?? {};
+    const path = typeof ti.file_path === 'string' ? ti.file_path : typeof ti.notebook_path === 'string' ? ti.notebook_path : null;
+    let touch: Touch;
+    if (path) {
+      const rel = relative(dir, isAbsolute(path) ? path : join(dir, path)).replace(/\\/g, '/');
+      if (!rel || rel.startsWith('..') || underGraft(dir, path)) return null;
+      touch = { file: rel, verb: input?.tool_name === 'Read' ? 'opened' : 'changed' };
+    } else if (typeof ti.command === 'string' && ti.command && !commandInvokesGraft(ti.command)) {
+      touch = { command: ti.command };
+    } else return null;
+    const notes = listNotes(dir, { branches: false });
+    if (!notes.length) return null;
+    const id = input?.session_id || 'default';
+    const s = readSession(dir, id);
+    const text = notesOnTouch(notes, touch, s);
+    if (text) writeSession(dir, id, s);
+    return text;
+  } catch {
+    // A learning that doesn't arrive costs one reminder; a broken hook costs the turn.
+    return null;
+  }
 }
 
 /**
@@ -429,6 +465,22 @@ function countTallyTurn(input: any, dir: string): void {
 /** Tool calls in one turn before it counts as digging worth a note. */
 export const NOTE_WORTHY_CALLS = 3;
 
+/**
+ * Reading that trail's answers stood in for, in one turn, before it counts as
+ * digging too. trail answers most questions in one or two calls, so on calls
+ * alone an exploratory turn never qualified and its findings were never saved.
+ */
+export const NOTE_WORTHY_TOKENS = 30_000;
+
+/** The reading a query stood in for, from its `[trail] tokens saved ≈ N` line. A
+ * reused learning's own line doesn't count: that digging was done before. */
+function codeReadIn(content: unknown): number {
+  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((c: any) => (typeof c?.text === 'string' ? c.text : '')).join('\n') : '';
+  let total = 0;
+  for (const m of text.matchAll(/\[(?:graft|trail)\] tokens saved ≈ ([\d,]+)/g)) total += Number(m[1]!.replace(/,/g, '')) || 0;
+  return total;
+}
+
 /** What the agent is told when a turn took real digging and left no note. */
 export const NOTE_ASK =
   '[trail] This took real digging and the session has saved no learning. Before you finish, save one for the next session: ' +
@@ -436,13 +488,15 @@ export const NOTE_ASK =
   "A summary, never a transcript, and nothing secret. If you've committed this work, commit the learning too. Then finish as trail's output asks, if it asks anything.";
 
 /**
- * Whether the turn that just ended deserves a note: it made at least
- * NOTE_WORTHY_CALLS tool calls since the person's last message, and nothing in
- * the session has run `trail note` yet. Pure, for tests: `text` is the
+ * Whether the turn that just ended deserves a note: since the person's last
+ * message it made at least NOTE_WORTHY_CALLS tool calls, or trail's answers in
+ * it stood in for at least NOTE_WORTHY_TOKENS of reading; and nothing in the
+ * session has run `trail note` yet. Pure, for tests: `text` is the
  * transcript's JSONL.
  */
 export function turnWantsNote(text: string): boolean {
   let calls = 0;
+  let codeRead = 0;
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     let e: any;
@@ -454,14 +508,18 @@ export function turnWantsNote(text: string): boolean {
     const content = e?.message?.content;
     const blocks: any[] = Array.isArray(content) ? content : [];
     // A message the person typed starts a new turn; a tool result does not.
-    if (e?.type === 'user' && (typeof content === 'string' || blocks.some((b) => b?.type === 'text'))) calls = 0;
+    if (e?.type === 'user' && (typeof content === 'string' || blocks.some((b) => b?.type === 'text'))) {
+      calls = 0;
+      codeRead = 0;
+    }
     for (const b of blocks) {
+      if (b?.type === 'tool_result') codeRead += codeReadIn(b.content);
       if (b?.type !== 'tool_use') continue;
       if (typeof b.input?.command === 'string' && NOTE_CALL.test(b.input.command)) return false;
       calls++;
     }
   }
-  return calls >= NOTE_WORTHY_CALLS;
+  return calls >= NOTE_WORTHY_CALLS || codeRead >= NOTE_WORTHY_TOKENS;
 }
 
 /**

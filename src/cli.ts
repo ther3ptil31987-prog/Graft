@@ -32,6 +32,7 @@ import { contextDirFor } from "./context/node-file.js";
 import { loadGraphCached } from "./graph/load.js";
 import { ensureFreshChildren, ensureFreshGraph, refreshNote } from "./graph/refresh.js";
 import { isWorkspaceBuildRoot, readWorkspace } from "./graph/workspace.js";
+import { NOT_GIT_LINE, homeFolderRefusal, isGitWorkTree } from "./init-guard.js";
 import { hasGraftIndex, nearestGraftRoot } from "./graph/root.js";
 import { unsupportedExtensions, supportedExtensions } from "./graph/source-files.js";
 import { discoverWorkspaceChildren } from "./graph/scopes.js";
@@ -1351,10 +1352,10 @@ async function runNoteCommand(repo: string, opts: NoteOptions): Promise<void> {
   // session edited. Explicit --touches means just this repo.
   const targets = opts.touches
     ? [{ dir: repo, touches: opts.touches.split(",").map((t) => t.trim()).filter(Boolean) }]
-    : noteTargets(repo, spent?.edited ?? [], spent?.startedAt).map((t) => ({
-        ...t,
-        // And the files the note names, for a session that read code without editing it.
-        touches: [...new Set([...t.touches, ...mentionedFiles(t.dir, body)])].slice(0, 10),
+    : noteTargets(repo, spent?.edited ?? [], spent?.startedAt, spent ? { read: spent.read } : undefined).map((t) => ({
+        dir: t.dir,
+        // Then the files the note names, then the ones the session only read.
+        touches: [...new Set([...t.touches, ...mentionedFiles(t.dir, body), ...(t.read ?? [])])].slice(0, 10),
       }));
   const author = opts.author?.trim() || noteAuthor(repo);
   const date = new Date().toISOString().slice(0, 10);
@@ -1436,6 +1437,15 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
     }
     const repo = resolve(dir);
     const explicit = Array.isArray(opts.agents) ? opts.agents : undefined;
+
+    // Checked before anything is written: run from the home folder, init wired
+    // it, mapped every code file under it, then said to commit.
+    const refusal = homeFolderRefusal(repo);
+    if (refusal) {
+      console.error(refusal);
+      process.exitCode = 1;
+      return null;
+    }
 
     if (explicit) {
       const validIds = [...hostIds(), "claude"];
@@ -1685,7 +1695,10 @@ async function runInitCommand(dir: string, opts: InitOptions): Promise<{ ids: st
         return r.status !== 0 || r.stdout.trim().length > 0;
       });
       tops.splice(0, tops.length, ...changedTops);
-      if (tops.length)
+      // Outside git there is nothing to commit to, and `git status` failing above
+      // made every path look changed.
+      if (TRAIL && !children.length && !isGitWorkTree(repo)) console.error(NOT_GIT_LINE);
+      else if (tops.length)
         console.error(
           TRAIL
             ? `· commit ${tops.slice(0, 5).join(" and ")}${tops.length > 5 ? ` +${tops.length - 5} more` : ""} once — after that, teammates' Claude reads your learnings even before they install trail`
