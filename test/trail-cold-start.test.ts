@@ -9,13 +9,16 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { claudeBin, digest, finishPastRead, ownWords, readSession, scrub, sessionFiles, verify, type Finding, type FindResult, type PastSession } from "../src/notes/cold-start.js";
+import { claudeBin, ownWords, readSession, scrub, sessionFiles, verify, withoutSecrets, type PastSession } from "../src/notes/cold-start.js";
 import { ensureRepoHome } from "../src/notes/home.js";
 import { standingDirective } from "../src/claude/format.js";
 import { commitLines, namesLabel, parseNote, PERSONAL_SAVED_LINE, standingLearnings } from "../src/notes/notes.js";
 import { teammatesOn } from "../src/notes/git-facts.js";
 import { claudeProjectDir } from "../src/notes/session-cost.js";
 import { tmpRepo } from "./helpers.js";
+
+// Days are local dates (init-days.test.ts); these fixtures are written in UTC.
+process.env.TZ = "UTC";
 
 function transcript(entries: object[]): string {
   return entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
@@ -81,11 +84,10 @@ function session(id: string, at: string, ...texts: string[]): PastSession {
 
 test("a finding is kept only when its quotes are in two sessions, and they're counted by trail", () => {
   const sessions = [
-    session("aaaaaaaa-1", "2026-10-09T00:00:00Z", "no, open the PR against the dev branch please"),
-    session("bbbbbbbb-2", "2026-10-01T00:00:00Z", "again: open the PR against the dev branch"),
-    session("cccccccc-3", "2026-09-20T00:00:00Z", "something else entirely"),
+    session("aaaaaaaa-1", "2026-10-09T12:00:00Z", "no, open the PR against the dev branch please"),
+    session("bbbbbbbb-2", "2026-10-01T12:00:00Z", "again: open the PR against the dev branch"),
+    session("cccccccc-3", "2026-09-20T12:00:00Z", "something else entirely"),
   ];
-  const { ids } = digest(sessions);
   const out = verify(
     [
       {
@@ -102,7 +104,6 @@ test("a finding is kept only when its quotes are in two sessions, and they're co
       { title: "Only once", for: "you", body: "## Decided\n- y", evidence: [{ session: "cccccccc", quote: "something else entirely" }] },
     ],
     sessions,
-    ids,
   );
   assert.equal(out.length, 1);
   assert.equal(out[0]!.title, "Open PRs against dev");
@@ -110,19 +111,67 @@ test("a finding is kept only when its quotes are in two sessions, and they're co
   assert.equal(out[0]!.last, "2026-10-09");
 });
 
-test("the digest is newest first and stops at its size", () => {
-  const sessions = [session("new00000", "2026-10-09T00:00:00Z", "x".repeat(50)), session("old00000", "2026-09-01T00:00:00Z", "y".repeat(50))];
-  const small = digest(sessions, 90);
-  assert.ok(small.text.startsWith("=== session new00000"));
-  assert.deepEqual([...small.ids.keys()], ["new00000"]);
+test("a finding needs its quotes on two different days: two restarts one morning are one, a long session typed into on two days is two", () => {
+  const ask = "write the reddit post about the launch";
+  const restarts = [
+    { id: "r1111111-a", at: "2026-10-09T09:00:00Z", prompts: [{ text: ask, at: "2026-10-09T09:00:00Z" }] },
+    { id: "r2222222-b", at: "2026-10-09T09:05:00Z", prompts: [{ text: ask, at: "2026-10-09T09:05:00Z" }] },
+  ];
+  const raw = [{ title: "Write the launch post", for: "you", body: "## Decided\n- x", evidence: [{ session: "r1111111", quote: ask }, { session: "r2222222", quote: ask }] }];
+  assert.deepEqual(verify(raw, restarts), [], "one morning's restart is one occasion");
+
+  const long = [{ id: "l3333333-c", at: "2026-10-01T10:00:00Z", prompts: [{ text: "remove the em dash please", at: "2026-10-01T10:00:00Z" }, { text: "again, remove the em dash", at: "2026-10-04T10:00:00Z" }] }];
+  const kept = verify([{ title: "No em dashes", for: "you", body: "## Decided\n- y", evidence: [{ session: "l3333333", quote: "remove the em dash" }, { session: "l3333333", quote: "remove the em dash please" }] }], long);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0]!.days, 2);
+  assert.deepEqual(kept[0]!.sessions, ["l3333333-c"]);
+  assert.equal(kept[0]!.last, "2026-10-04");
 });
 
 test("anything like a credential or an email is scrubbed before a learning is written", () => {
-  const out = scrub("use ghp_abcdefghijklmnopqrstuvwxyz1234 and password: hunter2 for anirudh@acme.test, key AKIAABCDEFGHIJKLMNOP");
+  const out = scrub("use ghp_abcdefghijklmnopqrstuvwxyz1234 and password: hunter2 for maya@acme.test, key AKIAABCDEFGHIJKLMNOP");
   assert.ok(!out.includes("ghp_"));
   assert.ok(!out.includes("hunter2"));
-  assert.ok(!out.includes("anirudh@acme.test"));
+  assert.ok(!out.includes("maya@acme.test"));
   assert.ok(!out.includes("AKIA"));
+});
+
+test("a finding whose title, body or quotes hold a secret is left out whole, and counted, not scrubbed and kept", () => {
+  const day = (d: number) => `2026-10-0${d}T10:00:00Z`;
+  const sessions = [
+    { id: "s1111111-a", at: day(1), prompts: [{ text: "push with ghp_abcdefghijklmnopqrstuvwxyz0123456789 when https fails", at: day(1) }, { text: "always run go test with -race first", at: day(1) }] },
+    { id: "s2222222-b", at: day(3), prompts: [{ text: "again push with ghp_abcdefghijklmnopqrstuvwxyz0123456789 when https fails", at: day(3) }, { text: "please always run go test with -race first", at: day(3) }] },
+  ];
+  const ev = (quote: string) => [{ session: "s1111111", quote }, { session: "s2222222", quote }];
+  const found = verify(
+    [
+      { title: "Push with the saved token", for: "you", body: "## Decided\n- Push over HTTPS.", evidence: ev("ghp_abcdefghijklmnopqrstuvwxyz0123456789 when https fails") },
+      { title: "Set the key", for: "you", body: "## Decided\n- export TRAIL_API_KEY=nn3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8", evidence: ev("always run go test with -race first") },
+      { title: "Run go test with -race", for: "team", body: "## Decided\n- Run `go test -race ./...` first.", evidence: ev("always run go test with -race first") },
+    ],
+    sessions,
+  );
+  assert.equal(found.length, 3, "verify only checks the quotes are there");
+  assert.ok(found[1]!.body.includes("TRAIL_API_KEY=nn3f9a"), "nothing is scrubbed in place");
+  const { findings, leftOut } = withoutSecrets(found);
+  assert.deepEqual(findings.map((f) => f.title), ["Run go test with -race"]);
+  assert.equal(leftOut, 2);
+});
+
+test("a quote Claude copied without its punctuation still carries the secret it came from: the finding is left out", () => {
+  // The typed words hold a key; the cited quote matches them once punctuation and case are set aside, and looks clean.
+  const day = (d: number) => `2026-10-0${d}T10:00:00Z`;
+  const key = "export TRAIL_API_KEY=Zk3q9XvB2mN8pL4tR7wY1sD6 before the deploy";
+  const sessions = [
+    { id: "s1111111-a", at: day(1), prompts: [{ text: key, at: day(1) }] },
+    { id: "s2222222-b", at: day(3), prompts: [{ text: `again: ${key}`, at: day(3) }] },
+  ];
+  const quote = "export trail api key zk3q9xvb2mn8pl4tr7wy1sd6 before the deploy";
+  const found = verify([{ title: "Set the key before deploying", for: "you", body: "## Decided\n- Set the key first.", evidence: [{ session: "s1111111", quote }, { session: "s2222222", quote }] }], sessions);
+  assert.equal(found.length, 1, "the quote is really there");
+  const { findings, leftOut } = withoutSecrets(found);
+  assert.deepEqual(findings, []);
+  assert.equal(leftOut, 1);
 });
 
 test("the closing lines name who works there and the head start, or a faster PR when it's under 80k tokens", () => {
@@ -196,15 +245,36 @@ function fakeClaude(): string {
   };
   writeFileSync(
     join(bin, "claude"),
-    `#!/usr/bin/env node\nif (process.argv.includes("--version")) { console.log("9.9.9"); process.exit(0); }\nprocess.stdin.resume(); process.stdin.on("end", () => console.log(${JSON.stringify(JSON.stringify(answer))}));\n`,
+    `#!/usr/bin/env node\nif (process.argv.includes("--version")) { require("fs").appendFileSync(${JSON.stringify(join(bin, "version-calls"))}, "v\\n"); console.log("9.9.9"); process.exit(0); }\nrequire("fs").appendFileSync(${JSON.stringify(join(bin, "calls"))}, "-p\\n");\nprocess.stdin.resume(); process.stdin.on("end", () => console.log(${JSON.stringify(JSON.stringify(answer))}));\n`,
   );
   chmodSync(join(bin, "claude"), 0o755);
   return bin;
 }
 
-function initRun(repo: string, home: string, bin: string) {
-  const r = spawnSync(process.execPath, ["--import", "tsx", join(process.cwd(), "src", "bin", "trail.ts"), "init", repo, "--agents", "claude", "--no-build", "--no-global"], {
+/** How many times the stand-in was asked. */
+const calls = (bin: string) => (existsSync(join(bin, "calls")) ? readFileSync(join(bin, "calls"), "utf8").split("\n").filter(Boolean).length : 0);
+
+/** The repo's folder under a test HOME's ~/.trail, without touching this process's TRAIL_HOME. */
+function ensureRepoHomeAt(home: string, repo: string): string {
+  const saved = process.env.TRAIL_HOME;
+  process.env.TRAIL_HOME = join(home, ".trail");
+  try {
+    return ensureRepoHome(repo).place.dir;
+  } finally {
+    if (saved === undefined) delete process.env.TRAIL_HOME;
+    else process.env.TRAIL_HOME = saved;
+  }
+}
+
+function initRun(repo: string, home: string, bin: string, args: string[] = [], env: NodeJS.ProcessEnv = {}) {
+  return trailRun(repo, home, bin, ["init", repo, "--agents", "claude", "--no-build", "--no-global", ...args], env);
+}
+
+function trailRun(repo: string, home: string, bin: string, args: string[], env: NodeJS.ProcessEnv = {}) {
+  // tsx by its full address: the command runs from inside the repo.
+  const r = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), join(process.cwd(), "src", "bin", "trail.ts"), ...args], {
     encoding: "utf8",
+    cwd: repo,
     env: {
       ...process.env,
       HOME: home,
@@ -213,53 +283,86 @@ function initRun(repo: string, home: string, bin: string) {
       PATH: `${bin}:${process.env.PATH}`,
       DO_NOT_TRACK: "1",
       TRAIL_NO_FETCH: undefined,
+      TRAIL_NO_LOOK_BACK: undefined,
       CLAUDECODE: undefined,
       TRAIL_INVOKED_AS: undefined,
+      ...env,
     },
   });
   return { status: r.status, err: r.stderr };
 }
 
-// The stand-in for Claude Code is a shebang script, which Windows won't run as `claude`.
-test("trail init reads past sessions by itself and saves what came up twice, once per repo", { skip: process.platform === "win32" }, () => {
-  const home = mkdtempSync(join(tmpdir(), "cold-init-home-"));
-  const repo = tmpRepo("cold-init");
+/** A repo with two past sessions, on two days, each telling Claude the same two things. */
+function repoWithHistory(tag: string, home: string): string {
+  const repo = tmpRepo(tag);
   spawnSync("git", ["init", "-q"], { cwd: repo });
   const projects = claudeProjectDir(repo, home);
   mkdirSync(projects, { recursive: true });
-  for (const id of ["aaaaaaaa-1111", "bbbbbbbb-2222"]) {
+  // Two sessions on two different days: a restart the same morning would count once.
+  for (const [id, at] of [["aaaaaaaa-1111", "2026-10-01T10:00:00Z"], ["bbbbbbbb-2222", "2026-10-03T10:00:00Z"]]) {
     writeFileSync(
       join(projects, `${id}.jsonl`),
       transcript([
-        user("tell me what you understood first", { cwd: repo }),
+        user("tell me what you understood first", { cwd: repo, timestamp: at }),
         said("I pushed it."),
-        user("always run go test with -race before pushing", { cwd: repo }),
+        user("never use em dashes in the copy", { cwd: repo, timestamp: at }),
       ]),
     );
   }
+  return repo;
+}
+
+const learningFiles = (repo: string) => (existsSync(join(repo, ".trail", "learnings")) ? readdirSync(join(repo, ".trail", "learnings")).filter((f) => f.endsWith(".md")) : []);
+
+// The stand-in for Claude Code is a shebang script, which Windows won't run as `claude`.
+// 1b (R60, P2, R23): no find call any more. A run with no terminal relays what the no-model look-back found; an
+// agent's init never starts claude; `trail keep` keeps nothing without the receipt its PreToolUse check writes.
+// (Whether a spawned run with no TTY is the person's script or an agent depends on the process tree the suite runs
+// in, so these runs set CLAUDECODE; init-run.test.ts covers the script and the screen in process.)
+test("run by an agent, trail init looks back with no model and relays the person's own line once; claude is never started", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "cold-agent-home-"));
+  const repo = repoWithHistory("cold-agent", home);
   const bin = fakeClaude();
+  const r = initRun(repo, home, bin, [], { CLAUDECODE: "1" });
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.err, /· looking back at your past Claude Code sessions here \(about a minute\)/);
+  assert.match(r.err, /✓ looked back at 2 Claude Code sessions about this repo, typed into on 2 days \(Oct 1 to Oct 3\)/);
+  assert.equal(r.err.match(/Show the list as written/g)?.length, 1, "printed once");
+  assert.match(r.err, /\n1\. "never use em dashes in the copy" \(learning in your own words, every repo\)\n   You said this on 2 days\.\n/);
+  assert.match(r.err, /Keep: trail keep <numbers> · none: trail keep none\n/);
+  assert.doesNotMatch(r.err, /skills are off/, "skills are on by default: no line saying how to turn them on");
+  assert.doesNotMatch(r.err, /—|for your team|\bnotes?\b|\brules?\b|\bmemory\b|\bworkflows?\b/i, "init's words: learnings, no em dashes");
+  assert.equal(calls(bin), 0, "Claude Code was never asked");
+  assert.ok(!existsSync(join(bin, "version-calls")), "no claude process at all, not even claude --version");
+  assert.deepEqual(learningFiles(repo), [], "nothing in the repo");
 
-  const first = initRun(repo, home, bin);
-  assert.equal(first.status, 0, first.err);
-  assert.match(first.err, /· reading your 2 past Claude sessions here/);
-  assert.match(first.err, /✓ learned 2 things you told Claude more than once, from your last 2 sessions here/);
-  assert.match(first.err, /for your team · told Claude in 2 sessions: Run go test with -race before pushing/);
-  assert.match(first.err, /just for you  · told Claude in 2 sessions: Say what you understood before building/);
-  assert.match(first.err, /· Claude follows them from your next session\n🌱 Commit what you learned and your teammates' agents get to a PR 3x faster/);
+  const kept = trailRun(repo, home, bin, ["keep", "1"], { CLAUDECODE: "1" });
+  assert.equal(kept.status, 1, kept.err);
+  assert.match(kept.err, /Nothing kept: Trail couldn't find the person's answer after the list\./);
+  assert.ok(!existsSync(join(home, ".trail", "learnings")), "no receipt, nothing kept");
+});
 
-  const [file] = readdirSync(join(repo, ".trail", "learnings")).filter((f) => f.endsWith(".md"));
-  const team = parseNote(readFileSync(join(repo, ".trail", "learnings", file!), "utf8"), file!)!;
-  assert.equal(team.standing, true);
-  assert.match(team.body, /Told to Claude in 2 past sessions here/);
+test("an agent's trail init --yes keeps nothing (R25)", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "cold-yes-home-"));
+  const repo = repoWithHistory("cold-yes", home);
+  const r = initRun(repo, home, fakeClaude(), ["--yes"], { CLAUDECODE: "1" });
+  assert.equal(r.status, 0, r.err);
+  assert.match(r.err, /found 0 skills, 0 always-follow learnings and 1 learning\. Kept nothing: an agent ran this\./);
+  assert.ok(!existsSync(join(home, ".trail", "learnings")));
+  assert.deepEqual(learningFiles(repo), []);
+});
 
-  // The session-start directive lists both, the user's own first.
-  process.env.TRAIL_HOME = join(home, ".trail");
-  const directive = standingDirective(standingLearnings(repo));
-  assert.ok(directive.indexOf("Say what you understood") < directive.indexOf("Run go test with -race"));
-
-  const again = initRun(repo, home, bin);
-  assert.equal(again.status, 0, again.err);
-  assert.doesNotMatch(again.err, /reading your/, "read once per repo");
+test("TRAIL_NO_FETCH leaves the look-back on (nothing is fetched); TRAIL_NO_LOOK_BACK turns it off", { skip: process.platform === "win32" }, () => {
+  const home = mkdtempSync(join(tmpdir(), "cold-switch-home-"));
+  const off = repoWithHistory("cold-switch-off", home);
+  const bin = fakeClaude();
+  const r = initRun(off, home, bin, [], { TRAIL_NO_LOOK_BACK: "1", CLAUDECODE: "1" });
+  assert.equal(r.status, 0, r.err);
+  assert.doesNotMatch(r.err, /looking back/);
+  const on = repoWithHistory("cold-switch-on", home);
+  const r2 = initRun(on, home, bin, [], { TRAIL_NO_FETCH: "1", CLAUDECODE: "1" });
+  assert.match(r2.err, /looking back at your past Claude Code sessions/);
+  assert.equal(calls(bin), 0);
 });
 
 /* ---- finding Claude Code when it isn't on PATH ---- */
@@ -303,52 +406,3 @@ test("claudeBin skips an extension folder without the binary, and is null with n
 });
 
 /* ---- ticking which learnings to keep ---- */
-
-function found(title: string, forWho: "team" | "you"): Finding {
-  return { title, for: forWho, body: "## Decided\n- " + title + ".", sessions: ["a", "b", "c"], last: "2026-10-14", quotes: [] };
-}
-
-function readWith(findings: Finding[]) {
-  const result: FindResult = { sessions: 3, read: 3, findings, model: "claude-sonnet-5-5", durationMs: 10 };
-  return { sessions: 3, started: Date.now(), done: true, result: Promise.resolve(result) };
-}
-
-test("init saves only the learnings the person kept, and remembers the repo was read", async () => {
-  const home = mkdtempSync(join(tmpdir(), "keep-home-"));
-  const env = { TRAIL_HOME: process.env.TRAIL_HOME, DO_NOT_TRACK: process.env.DO_NOT_TRACK };
-  process.env.TRAIL_HOME = join(home, ".trail");
-  process.env.DO_NOT_TRACK = "1";
-  try {
-    const repo = tmpRepo("keep-some");
-    spawnSync("git", ["init", "-q"], { cwd: repo });
-    const all = [found("Use pnpm, not npm", "team"), found("Say what you understood first", "you"), found("Run go test with -race", "team")];
-    const { saved, kept, cancelled } = await finishPastRead(repo, readWith(all), async (f) => [f[0]!, f[2]!]);
-    assert.equal(cancelled, false);
-    assert.deepEqual(kept.map((f) => f.title), ["Use pnpm, not npm", "Run go test with -race"]);
-    assert.deepEqual(saved.map((n) => n.title), ["Use pnpm, not npm", "Run go test with -race"]);
-    assert.equal(readdirSync(join(repo, ".trail", "learnings")).filter((f) => f.endsWith(".md")).length, 2);
-    assert.ok(existsSync(join(ensureRepoHome(repo).place.dir, "past-sessions.json")), "read once per repo");
-  } finally {
-    process.env.TRAIL_HOME = env.TRAIL_HOME;
-    process.env.DO_NOT_TRACK = env.DO_NOT_TRACK;
-  }
-});
-
-test("cancelling the pick saves nothing, and the next init asks again", async () => {
-  const home = mkdtempSync(join(tmpdir(), "keep-none-home-"));
-  const env = { TRAIL_HOME: process.env.TRAIL_HOME, DO_NOT_TRACK: process.env.DO_NOT_TRACK };
-  process.env.TRAIL_HOME = join(home, ".trail");
-  process.env.DO_NOT_TRACK = "1";
-  try {
-    const repo = tmpRepo("keep-cancel");
-    spawnSync("git", ["init", "-q"], { cwd: repo });
-    const { saved, cancelled } = await finishPastRead(repo, readWith([found("Use pnpm, not npm", "team")]), async () => null);
-    assert.equal(cancelled, true);
-    assert.equal(saved.length, 0);
-    assert.equal(existsSync(join(repo, ".trail", "learnings")) && readdirSync(join(repo, ".trail", "learnings")).some((f) => f.endsWith(".md")), false);
-    assert.equal(existsSync(join(ensureRepoHome(repo).place.dir, "past-sessions.json")), false, "not marked read");
-  } finally {
-    process.env.TRAIL_HOME = env.TRAIL_HOME;
-    process.env.DO_NOT_TRACK = env.DO_NOT_TRACK;
-  }
-});

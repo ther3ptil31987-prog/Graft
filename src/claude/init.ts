@@ -3,7 +3,8 @@ import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { disableGraftServerIn, installClaudeGlobal, type GlobalWrite } from '../hosts/claude-global.js';
-import { mergeGraftSettings, mergeTrailShared, mergeTrailLocal } from './settings-merge.js';
+import { mergeGraftSettings, mergeTrailShared, mergeTrailLocal, withoutOurs } from './settings-merge.js';
+import { isJustMe } from '../notes/just-me.js';
 import { statuslineShim, hooksShim, rememberInstall } from './shim-template.js';
 import { skillTemplate } from './skill-template.js';
 import { mergeJsonKey, serverEntry, type McpWrite } from '../hosts/mcp-config.js';
@@ -97,10 +98,23 @@ export function buildGraphIfMissing(dir: string, opts: { build?: boolean; cliPat
   try {
     // execArgv carries the loader graft itself was started with (tsx, when run
     // from source), so the child can run a .ts entry point too.
-    execFileSync(process.execPath, [...process.execArgv, opts.cliPath, 'build', '.'], { cwd: dir, stdio: 'inherit', timeout: 300000 });
+    execFileSync(process.execPath, [...process.execArgv, opts.cliPath, 'build', '.'], { cwd: dir, stdio: 'inherit', timeout: 300000, windowsHide: true });
     return true;
   } catch {
     return false;
+  }
+}
+
+/** The repo's settings as an object to merge into: {} when missing or empty, null when it isn't plain JSON. */
+function readSettings(path: string): Record<string, any> | null {
+  let text: string;
+  try { text = readFileSync(path, 'utf8'); } catch { return {}; }
+  if (!text.trim()) return {};
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, any>) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -115,6 +129,8 @@ export interface InitResult {
   global: GlobalWrite[];
   warnings: string[];
   built: boolean;
+  /** Whose status line Claude Code shows here: trail's, one the person or team set, or none asked for. Trail only. */
+  statusline?: 'trail' | 'theirs' | 'off';
 }
 
 export function runInit(
@@ -129,8 +145,13 @@ export function runInit(
 
   const settingsPath = settings;
   const existing = readSettings(settingsPath);
-  const { merged, warnings } = mergeGraftSettings(existing, { statusline: opts.statusline, name: 'graft' });
-  writeFileSync(settingsPath, `${JSON.stringify(merged, null, 2)}\n`);
+  const { merged, warnings } = mergeGraftSettings(existing ?? {}, { statusline: opts.statusline, name: 'graft' });
+  // A file that isn't plain JSON (a comment, a trailing comma) is the
+  // person's, and rewriting it would drop what they put there, their own
+  // hooks included. Upkeep replays this at session start, so it has to hold
+  // there too. The ~/.claude copy still runs the hooks.
+  if (existing) writeFileSync(settingsPath, `${JSON.stringify(merged, null, 2)}\n`);
+  else warnings.push(notPlainJson('.claude/settings.json', "graft's hooks"));
 
   const sl = statusline;
   const hk = hooks;
@@ -162,8 +183,9 @@ export function runInit(
   return { settingsPath, shims: [sl, hk], skill: skillPath, mcp, global, warnings, built };
 }
 
-function readSettings(path: string): Record<string, any> {
-  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return {}; } // none/invalid → start fresh
+/** The warning for a settings file init left alone because it isn't plain JSON. */
+function notPlainJson(file: string, what: string): string {
+  return `Left ${file} as it was: it isn't plain JSON (a comment or a trailing comma?), and rewriting it would lose what's in it. Make it plain JSON and run init again to add ${what} there.`;
 }
 
 /**
@@ -184,16 +206,34 @@ function runTrailInit(
   writeFileSync(hook, hooksShim()); chmodSync(hook, 0o755);
   writeFileSync(statusline, statuslineShim()); chmodSync(statusline, 0o755);
   ignoreInTrailDir(dir, 'statusline.cjs');
+  // The map and its caches (`.trail/cache/`, context/map-dir.ts) are each machine's own. Said here as well as at
+  // the build: a hook or `--no-build` writes the cache there before any build adds the line.
+  ignoreInTrailDir(dir, 'cache/');
   rememberInstall(home);
 
-  const shared = mergeTrailShared(readSettings(settings));
-  mkdirSync(dirname(settings), { recursive: true });
-  writeFileSync(settings, `${JSON.stringify(shared, null, 2)}\n`);
+  // Either file, when it isn't plain JSON, is the person's and stays as it is
+  // (see runInit): rewriting it would drop their own hooks and settings.
+  // Just for this person (notes/just-me.ts), the shared file gets nothing: `~/.claude` runs the hooks.
+  const justMe = isJustMe(dir);
+  if (justMe) dropTrailShared(dir, settings);
+  const existingShared = justMe ? {} : readSettings(settings);
+  if (existingShared) {
+    mkdirSync(dirname(settings), { recursive: true });
+    if (!justMe) writeFileSync(settings, `${JSON.stringify(mergeTrailShared(existingShared), null, 2)}\n`);
+  }
 
   // Hooks for every other event come from `~/.claude`. Only when that's off do
   // they go in the personal file, beside the status line.
-  const { merged, warnings } = mergeTrailLocal(readSettings(local), { statusline: opts.statusline, hooks: !global });
-  writeFileSync(local, `${JSON.stringify(merged, null, 2)}\n`);
+  const existingLocal = readSettings(local);
+  const theirs = [readSettings(join(home, '.claude', 'settings.json')), existingShared];
+  // Just for this person with `~/.claude` off, nothing else runs SessionStart: it goes in the personal file too,
+  // unless a settings.json git tracks already has trail's.
+  const sharedNow = justMe ? readSettings(settings) : null;
+  const sessionStart = justMe && !global && !(sharedNow && JSON.stringify(withoutOurs(sharedNow)) !== JSON.stringify(sharedNow));
+  const { merged, warnings, statusline: shown } = mergeTrailLocal(existingLocal ?? {}, { statusline: opts.statusline, hooks: !global, sessionStart, theirs });
+  if (existingLocal) writeFileSync(local, `${JSON.stringify(merged, null, 2)}\n`);
+  else warnings.push(notPlainJson('.claude/settings.local.json', "trail's status line and allowlist"));
+  if (!existingShared) warnings.unshift(notPlainJson('.claude/settings.json', "trail's session-start hook"));
   keepOutOfGit(dir, join('.claude', 'settings.local.json'));
 
   let skillPath = '';
@@ -203,7 +243,8 @@ function runTrailInit(
     skillPath = skill;
   }
 
-  clearOldLayout(dir);
+  // An old settings.json left as it was still runs the old shims: they stay until it can be rewritten.
+  clearOldLayout(dir, { keepShims: !existingShared });
 
   const globalWrites = global ? installClaudeGlobal(home, 'trail') : [];
   // A trail repo on a machine with graft's server installed for everything:
@@ -211,7 +252,7 @@ function runTrailInit(
   if (global) globalWrites.push(disableGraftServerIn(home, resolve(dir)));
 
   const built = buildGraphIfMissing(dir, opts);
-  return { settingsPath: settings, shims: [statusline, hook], skill: skillPath, mcp: null, global: globalWrites, warnings, built };
+  return { settingsPath: settings, shims: [statusline, hook], skill: skillPath, mcp: null, global: globalWrites, warnings, built, statusline: shown };
 }
 
 /**
@@ -219,11 +260,13 @@ function runTrailInit(
  * `.claude/helpers/`, the skill in `.claude/skills/`, and trail's server in
  * `.mcp.json`. Settings entries are already gone: the merges replace them.
  */
-function clearOldLayout(dir: string): void {
+function clearOldLayout(dir: string, opts: { keepShims?: boolean } = {}): void {
   for (const n of ['graft', 'trail'] as const) {
     const [, oldSl, oldHk, oldSkill] = legacyClaudeTargets(dir, n).map((t) => t.path);
-    rmSync(oldSl, { force: true });
-    rmSync(oldHk, { force: true });
+    if (!opts.keepShims) {
+      rmSync(oldSl, { force: true });
+      rmSync(oldHk, { force: true });
+    }
     rmSync(dirname(oldSkill), { recursive: true, force: true });
   }
   // The folders they were in, once nothing else is: rmdir refuses a non-empty one.
@@ -231,6 +274,33 @@ function clearOldLayout(dir: string): void {
     try { rmdirSync(d); } catch { /* holds the user's files, or was never there */ }
   }
   dropServer(join(dir, '.mcp.json'), ['trail', 'graft']);
+}
+
+/**
+ * Take what an earlier init put in `.claude/settings.json` back out, for a repo
+ * on trail just for this person. The file goes if nothing else was in it. One
+ * git tracks is the team's and stays as it is.
+ */
+function dropTrailShared(dir: string, path: string): void {
+  try {
+    const existing = readSettings(path);
+    if (!existing || !existsSync(path)) return;
+    const kept = withoutOurs(existing);
+    if (JSON.stringify(kept) === JSON.stringify(existing)) return;
+    if (gitTracks(dir, join('.claude', 'settings.json'))) return;
+    if (Object.keys(kept).length === 0) rmSync(path, { force: true });
+    else writeFileSync(path, `${JSON.stringify(kept, null, 2)}\n`);
+  } catch { /* leave it as the user has it */ }
+}
+
+/** Git tracks `rel` in the checkout at `dir`. False outside git. */
+function gitTracks(dir: string, rel: string): boolean {
+  try {
+    execFileSync('git', ['ls-files', '--error-unmatch', '--', rel], { cwd: dir, stdio: 'ignore', windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Take trail's (or graft's) server out of an `.mcp.json`; the file goes if nothing else was in it. */
@@ -255,13 +325,13 @@ function dropServer(path: string, names: string[]): void {
  */
 export function keepOutOfGit(dir: string, rel: string): void {
   try {
-    execFileSync('git', ['check-ignore', '-q', '--', rel], { cwd: dir, stdio: 'ignore' });
+    execFileSync('git', ['check-ignore', '-q', '--', rel], { cwd: dir, stdio: 'ignore', windowsHide: true });
     return; // exit 0: already ignored
   } catch (e) {
     if ((e as { status?: number }).status !== 1) return; // 128: not a git checkout
   }
   try {
-    let exclude = execFileSync('git', ['rev-parse', '--git-path', 'info/exclude'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    let exclude = execFileSync('git', ['rev-parse', '--git-path', 'info/exclude'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
     if (!isAbsolute(exclude)) exclude = join(dir, exclude);
     const line = `/${rel.split('\\').join('/')}`;
     const text = existsSync(exclude) ? readFileSync(exclude, 'utf8') : '';
@@ -269,4 +339,16 @@ export function keepOutOfGit(dir: string, rel: string): void {
     mkdirSync(dirname(exclude), { recursive: true });
     appendFileSync(exclude, `${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`);
   } catch { /* best-effort: git status shows the file, and nothing else breaks */ }
+}
+
+/** Undo `keepOutOfGit`: `rel`'s line comes out of `.git/info/exclude`, so git sees it again. */
+export function letGitSee(dir: string, rel: string): void {
+  try {
+    let exclude = execFileSync('git', ['rev-parse', '--git-path', 'info/exclude'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
+    if (!isAbsolute(exclude)) exclude = join(dir, exclude);
+    const line = `/${rel.split('\\').join('/')}`;
+    const text = readFileSync(exclude, 'utf8');
+    const kept = text.split('\n').filter((l) => l.trim() !== line);
+    if (kept.length !== text.split('\n').length) writeFileSync(exclude, kept.join('\n'));
+  } catch { /* not a git checkout, or no exclude file: nothing hides it */ }
 }

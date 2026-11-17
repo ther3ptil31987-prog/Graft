@@ -19,12 +19,18 @@
  * - a decision or takeaway whose words the added lines carry (follows).
  *
  * It errs towards silence: a conflict fails the CLI, so one is reported only
- * on evidence in the diff itself, quoted from the source.
+ * on evidence in the diff itself, quoted from the source, and only from a
+ * learning that has earned it: the repo's, committed on the base branch, about
+ * the exact file changed. Anything else that goes against the diff (a
+ * teammate's unmerged branch, a learning just for you, one added on this
+ * branch, one about another file or matched on words) is a lead: worth a
+ * look, never a failure. Replaced and retired learnings aren't read at all.
  *
  * Approved brain rules exist only on the server, so this check has none.
  */
 import { posix } from "node:path";
 import type { CheckFinding, CheckResult } from "./types.js";
+import { liveLearnings, replacementsOf } from "../notes/learning-fields.js";
 import type { Note } from "../notes/notes.js";
 import type { Skill } from "../skills/skills.js";
 
@@ -59,6 +65,8 @@ export interface LocalCheckInput {
   /** Who is asking (first name). The server only records it: a note by the asker is still a candidate. */
   asker?: string;
   now?: Date;
+  /** Whether a learning is committed on the base branch. Only those can fail the check; by default every repo learning counts. */
+  committed?: (note: Note) => boolean;
 }
 
 /**
@@ -72,7 +80,11 @@ export function checkLocally(input: LocalCheckInput): CheckResult {
   const now = input.now ?? new Date();
   const diffFiles = parseTrailDiff(input.diff);
   const files = trailCheckFiles(input.files, diffFiles).slice(0, MAX_FILES);
-  const out: CheckResult = { files: files.length, notes: input.notes.length, skills: input.skills.length, findings: [] };
+  // A replacement hides a learning that can fail the check only when it's on the base branch too: one
+  // saved on this branch (by the agent the check is holding to account, say) hasn't been agreed to yet.
+  const committed = input.committed ?? (() => true);
+  const live = liveLearnings(input.notes, (r, x) => !committed(x) || committed(r));
+  const out: CheckResult = { files: files.length, notes: live.length, skills: input.skills.length, findings: [] };
   if (files.length === 0) return out;
 
   const terms = trailDiffTerms(
@@ -80,14 +92,20 @@ export function checkLocally(input: LocalCheckInput): CheckResult {
     DIFF_TERMS,
   );
   const { files: fileList, dirs: dirList } = filesAndDirs(files);
-  const notes = notePool(input.notes, terms, fileList, dirList);
+  const notes = notePool(live, terms, fileList, dirList);
   const skills = input.skills.map((skill) => ({
     skill,
     textScore: localTextScore(termHits(`${skill.name}\n${candidateText({ kind: "skill", skill })}`, terms)),
   }));
   const candidates = selectTrailCheckCandidates(files, terms, notes, skills, now);
   if (candidates.length === 0) return out;
-  out.findings = judgeTrailCheck(candidates, diffFiles);
+  out.findings = judgeTrailCheck(candidates, diffFiles, input.committed);
+  for (const f of out.findings) {
+    if (f.verdict === "follows" || f.source.kind !== "note") continue;
+    const cited = live.find((n) => n.path === f.source.path);
+    const [r] = cited ? replacementsOf(input.notes, cited) : [];
+    if (r) f.replacedBy = { id: r.id, title: r.title.replace(/\s+/g, " ").trim().slice(0, 120) };
+  }
   return out;
 }
 
@@ -640,7 +658,7 @@ function statementsOf(c: Candidate): Statement[] {
 function owner(c: Candidate): string {
   if (c.kind === "skill") return `skill ${c.skill.name}`;
   const a = c.note.author.trim();
-  return a ? `${a}'s learning` : "a team learning";
+  return a ? `${a}'s learning` : "a learning";
 }
 
 /**
@@ -815,17 +833,39 @@ function firstLineWith(lines: DiffLine[], terms: string[]): number {
   return 0;
 }
 
+/** Which finding wins for one (file, candidate), and the order findings are listed in. */
+const RANK: Record<CheckFinding["verdict"], number> = { conflict: 2, lead: 1, follows: 0 };
+
+/**
+ * Why going against `note` in `file` can only be a lead, or null when it can
+ * fail the check: a repo learning, committed on the base branch, about this
+ * very file.
+ */
+function leadReason(note: Note, file: string, committed: (n: Note) => boolean): string | null {
+  if (note.ref) return `on ${note.ref.replace(/^origin\//, "")}, not merged yet`;
+  if (note.scope === "personal") return "a learning just for you";
+  if (note.scope === "team") return "a team learning";
+  if (!committed(note)) return "not on the base branch yet";
+  if (!touchMatch(note.touches, [file], []).exact) return "not about this file";
+  return null;
+}
+
 /**
  * Holds the diff against the candidates with the rules above. One finding per
- * (file, candidate), a conflict winning over a follow; conflicts first, then
- * by file and line; at most 20. Exported for tests.
+ * (file, candidate), a conflict winning over a lead and a lead over a follow;
+ * a conflict only from a learning that can fail the check (`leadReason`).
+ * Conflicts first, then leads, then by file and line; at most 20. Exported
+ * for tests.
  */
-export function judgeTrailCheck(candidates: Candidate[], diffFiles: DiffFile[]): CheckFinding[] {
+export function judgeTrailCheck(candidates: Candidate[], diffFiles: DiffFile[], committed: (n: Note) => boolean = () => true): CheckFinding[] {
   const best = new Map<string, CheckFinding>();
   const put = (file: string, ci: number, f: CheckFinding) => {
+    const c = candidates[ci]!;
+    const why = f.verdict === "conflict" && c.kind === "note" ? leadReason(c.note, file, committed) : null;
+    if (why) f = { ...f, verdict: "lead", why };
     const k = `${file}\0${ci}`;
     const cur = best.get(k);
-    if (!cur || (cur.verdict !== "conflict" && f.verdict === "conflict")) best.set(k, f);
+    if (!cur || RANK[f.verdict] > RANK[cur.verdict]) best.set(k, f);
   };
   const statements = candidates.map(statementsOf);
 
@@ -889,7 +929,7 @@ export function judgeTrailCheck(candidates: Candidate[], diffFiles: DiffFile[]):
 
   const out = [...best.values()];
   out.sort((a, b) => {
-    if ((a.verdict === "conflict") !== (b.verdict === "conflict")) return a.verdict === "conflict" ? -1 : 1;
+    if (a.verdict !== b.verdict) return RANK[b.verdict] - RANK[a.verdict];
     if (a.file !== b.file) return a.file < b.file ? -1 : 1;
     return (a.line ?? 0) - (b.line ?? 0);
   });

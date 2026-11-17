@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -277,4 +277,38 @@ test("paths under the home folder read as ~/", () => {
   assert.equal(shownPath(join(homedir(), ".trail", "repos", "x")), "~/.trail/repos/x");
   assert.equal(shownPath("/srv/elsewhere"), "/srv/elsewhere");
   assert.equal(shownPath("notes/a.md"), "notes/a.md");
+});
+
+test("noteCount counts only live learnings: not retired, held or replaced ones", () => {
+  const env = home();
+  const d = repo("count-live", "git@github.com:acme/api.git");
+  const dir = join(d, ".trail", "learnings");
+  mkdirSync(dir, { recursive: true });
+  const file = (name: string, extra = "", date = "2026-10-08") => writeFileSync(join(dir, name), `---\ntitle: "${name}"\nauthor: Priya\ndate: ${date}\n${extra}---\n\n${BODY}\n`);
+  file("2026-10-08-active-priya.md");
+  file("2026-10-08-retired-priya.md", "status: retired\n");
+  file("2026-10-08-held-priya.md", "status: held\n");
+  file("2026-10-08-old-priya.md", "id: l-0a0a0a0a\n");
+  file("2026-10-09-new-priya.md", "id: l-0b0b0b0b\nreplaces: l-0a0a0a0a\n", "2026-10-09");
+  writeFileSync(join(dir, "README.md"), "not a learning\n");
+  assert.equal(noteCount(d, env), 2, "the active one and the one that replaced the old one");
+  writeNote(d, { title: "Mine", body: BODY, author: "Priya", date: "2026-10-10" }, "personal");
+  assert.equal(noteCount(d, env), 3);
+});
+
+// Codex runs the agent's commands in a sandbox that can write the repo but not ~/.trail.
+test("a learning for the repo is saved when ~/.trail can't be written; a personal one still says why not", { skip: process.platform === "win32" || process.getuid?.() === 0 }, () => {
+  home();
+  const d = repo("note-ro-home", "git@github.com:acme/ro.git");
+  const locked = mkdtempSync(join(tmpdir(), "trail-home-ro-"));
+  chmodSync(locked, 0o555);
+  process.env.TRAIL_HOME = join(locked, ".trail");
+  try {
+    const n = writeNote(d, { title: "Bbox rotation", body: BODY, author: "Priya", date: "2026-10-07" });
+    assert.ok(existsSync(n.path) && n.path.startsWith(join(d, ".trail", "learnings")), n.path);
+    assert.equal(n.scope, "repo");
+    assert.throws(() => writeNote(d, { title: "Tabs", body: BODY, author: "Priya", date: "2026-10-07" }, "personal"), /EACCES/);
+  } finally {
+    chmodSync(locked, 0o755);
+  }
 });

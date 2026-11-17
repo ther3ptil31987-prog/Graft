@@ -127,10 +127,17 @@ export function needsRefresh(cache: UpdateCache | null, now = Date.now()): boole
  * Only called from long-lived or already-slow contexts (a CLI command, MCP
  * boot) — never from a hook, which reads the cache and nothing else.
  */
-export function maybeRefreshInBackground(home?: string, now = Date.now()): boolean {
+export function maybeRefreshInBackground(
+  home?: string,
+  now = Date.now(),
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const doNotTrack = env.DO_NOT_TRACK;
+  if (doNotTrack !== undefined && doNotTrack !== '' && doNotTrack !== '0') return false;
   const cache = readUpdateCache(home);
   if (!needsRefresh(cache, now)) return false;
   writeUpdateCache({ latest: cache?.latest ?? null, checkedAt: now }, home);
+  if (readUpdateCache(home)?.checkedAt !== now) return false;
   try {
     const child = spawn(process.execPath, [graftCliPath(), '_update-check'], {
       detached: true,
@@ -175,6 +182,8 @@ export interface WiringOpts {
   hooks: boolean;
   /** false → skip Claude Code statusLine (`--no-statusline` / GRAFT_NO_STATUSLINE). */
   statusline: boolean;
+  /** `--agents auto`: the only hosts that write outside the repo (the agents installed when it ran). Absent → every wired host. */
+  laptop?: string[];
 }
 
 export const DEFAULT_WIRING_OPTS: WiringOpts = { global: true, mcp: true, hooks: true, statusline: true };
@@ -307,9 +316,8 @@ export function formatWiringRefresh(r: WiringRefresh | null): string | null {
   // Said to the agent at session start, which is who can tell the person.
   if (r.switched)
     return (
-      `[trail] graft is now trail, and this repo just moved to it: the same commands under the new name, plus learnings in .trail/learnings/ that the whole team shares. ` +
-      `trail is reading the user's past Claude sessions here in the background, and what it learns is there from the next session. ` +
-      `Tell the user this once, in a line at the end of your first reply, and that committing .trail/ and .claude/settings.json once moves their team over too.`
+      `[trail] graft is now trail, and this repo just moved to it: the same commands under the new name, plus learnings in .trail/learnings/ for everyone working in this repo. ` +
+      `Tell the user this once, in a line at the end of your first reply, and that committing .trail/ and .claude/settings.json once moves the repo over for everyone working in it.`
     );
   // Name the out-of-repo writes explicitly: those are machine-wide and shared by
   // every repo, so a user seeing this line should not have to guess what moved.

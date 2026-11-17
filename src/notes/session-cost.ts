@@ -38,7 +38,8 @@ export interface SessionCost {
   read: string[];
 }
 
-const IDLE_MS = 10 * 60 * 1000;
+/** A gap between two transcript entries longer than this is time away, not work. */
+export const IDLE_MS = 10 * 60 * 1000;
 /** With nothing in the transcript naming what the note is about, at most this much active time counts. */
 export const FALLBACK_ACTIVE_MS = 30 * 60 * 1000;
 /** A transcript untouched this long belongs to some earlier session. */
@@ -53,7 +54,7 @@ export function claudeProjectDir(repo: string, home: string = homedir()): string
  * the nearest ancestor's. A note saved from a subfolder, or from one repo of
  * a session started in the folder above several, still finds its session.
  */
-function sessionProjectDir(dir: string, home?: string): string | null {
+export function sessionProjectDir(dir: string, home?: string): string | null {
   for (let d = resolve(dir); ; d = dirname(d)) {
     const p = claudeProjectDir(d, home);
     if (existsSync(p)) return p;

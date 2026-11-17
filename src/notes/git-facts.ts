@@ -9,7 +9,7 @@ import { userInfo } from "node:os";
 /** git's stdout, trimmed unless `raw` (porcelain status starts lines with a meaningful space). */
 function git(repo: string, args: string[], raw = false): string | null {
   try {
-    const out = execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const out = execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
     return raw ? out : out.trim();
   } catch {
     return null;
@@ -41,6 +41,14 @@ export function ownPath(p: string): boolean {
   // .gitignore and .ignore too: `trail init` and the code map add their lines
   // to them, which is never what a session's note is about.
   return /^(graft|\.graft|\.claude|\.cursor|\.codex|\.trail)(\/|$)/.test(p) || p === ".mcp.json" || p === ".gitignore" || p === ".ignore";
+}
+
+/** Files the agent instructions live in: trail writes them, so editing them is setting trail up. */
+const AGENT_FILES = new Set(["AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md"]);
+
+/** A repo path that is trail's or the agents' own (`ownPath`, plus AGENTS.md and the like): never what a learning is about. */
+export function trailOwnPath(p: string): boolean {
+  return ownPath(p) || AGENT_FILES.has(p);
 }
 
 /**

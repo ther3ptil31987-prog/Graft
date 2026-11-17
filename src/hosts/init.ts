@@ -12,6 +12,7 @@ import type { Brand } from '../brand.js';
 import { registerMcpConfigs, type McpWrite } from './mcp-config.js';
 import { installCodexHooks } from './codex-hooks.js';
 import { installCursorHooks } from './cursor-hooks.js';
+import { installPiHooks } from './pi-hooks.js';
 import type { ConfigWrite } from './config-write.js';
 import { installAntigravitySkill } from './antigravity.js';
 import { rememberInstall } from '../claude/shim-template.js';
@@ -60,6 +61,8 @@ export function runHostsInit(
     hooks?: boolean;
     /** false → skip every write outside the repo (the ~/.codex/ targets). */
     global?: boolean;
+    /** When given, only these hosts write outside the repo (`init --agents auto`: the agents installed here). */
+    laptop?: string[];
     /** The name `init` runs under; trail's moves the repo to trail's names (see `hostWiringName`). */
     brand?: Brand;
   } = {},
@@ -93,13 +96,15 @@ export function runHostsInit(
     written.push({ id: host.id, path, action });
   }
   const skipped = HOSTS.filter((h) => !selected.includes(h)).map((h) => h.id);
+  // Whether `id` may write outside the repo on this run.
+  const outside = (id: string) => opts.global !== false && (opts.laptop === undefined || opts.laptop.includes(id));
   const mcp =
     opts.mcp === false
       ? []
-      : registerMcpConfigs(repo, selected.map((h) => h.id), { home, global: opts.global, name });
+      : registerMcpConfigs(repo, selected.map((h) => h.id), { home, global: opts.global, name, laptop: opts.laptop });
   // The Codex hook targets are user-level (~/.codex), so --no-global suppresses them.
   const hooks =
-    opts.hooks === false || opts.global === false || !selected.some((h) => h.id === 'agents')
+    opts.hooks === false || !outside('agents') || !selected.some((h) => h.id === 'agents')
       ? []
       : installCodexHooks(home);
   // Cursor's hooks are repo-local (.cursor/hooks.json), matching the Cursor-only,
@@ -108,12 +113,18 @@ export function runHostsInit(
     opts.hooks === false || !selected.some((h) => h.id === 'cursor')
       ? []
       : installCursorHooks(repo, name);
-  // Both write the hooks shim, which finds this install through the trail home.
-  if (hooks.length > 0 || cursorHooks.length > 0) rememberInstall(home);
+  // Pi's hook layer is user-level too (~/.pi/ extension + shim), so --no-global
+  // suppresses it like the Codex hooks.
+  const piHooks =
+    opts.hooks === false || opts.global === false || !selected.some((h) => h.id === 'pi')
+      ? []
+      : installPiHooks(home, name);
+  // All three write the hooks shim, which finds this install through the trail home.
+  if (hooks.length > 0 || cursorHooks.length > 0 || piHooks.length > 0) rememberInstall(home);
   // Antigravity's skill is a global write too, so --no-global suppresses it as well.
   const antigravitySkill =
-    opts.global === false || !selected.some((h) => h.id === 'antigravity')
+    !outside('antigravity') || !selected.some((h) => h.id === 'antigravity')
       ? []
       : installAntigravitySkill(home, name);
-  return { written, skipped, unknown, mcp, hooks: [...hooks, ...cursorHooks, ...antigravitySkill] };
+  return { written, skipped, unknown, mcp, hooks: [...hooks, ...cursorHooks, ...piHooks, ...antigravitySkill] };
 }

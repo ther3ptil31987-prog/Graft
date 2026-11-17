@@ -59,7 +59,7 @@ export function claudeGlobalTargets(home: string, brand: Brand = 'graft'): Plann
     ({ hostId: 'claude', id, path, scope: 'global', kind, what });
   const writes = [
     g('claude-global-shim', join(globalHelpersDir(home), 'graft-hooks.cjs'), 'hook', 'hooks shim (user level)'),
-    g('claude-global-hooks', join(home, '.claude', 'settings.json'), 'hook', 'SessionStart / UserPromptSubmit / PostToolUse / Stop / SessionEnd'),
+    g('claude-global-hooks', join(home, '.claude', 'settings.json'), 'hook', 'SessionStart / UserPromptSubmit / PreToolUse / PostToolUse / PostToolUseFailure / Stop / SessionEnd'),
     g('claude-global-mcp', join(home, '.claude.json'), 'mcp', `mcpServers.${brand}`),
   ];
   // trail registers no server for Claude Code: the hooks and the `trail` command do its work.
@@ -122,7 +122,8 @@ export function installClaudeGlobal(home: string, brand: Brand = 'graft'): Globa
   // graft's keeps serving every repo still wired as graft; a trail repo turns
   // it off for its own folder (see disableGraftServerIn).
   if (brand === 'trail') {
-    out.push(dropUserServer(mcp.id, mcp.path, 'trail'));
+    // The workspace server `init --connect` adds stays: it serves no repo tools.
+    out.push(dropUserServer(mcp.id, mcp.path, 'trail', isBrainsServer));
     return out;
   }
   try {
@@ -134,13 +135,14 @@ export function installClaudeGlobal(home: string, brand: Brand = 'graft'): Globa
   return out;
 }
 
-/** Remove one user-scope server from `~/.claude.json`, leaving everything else. */
-function dropUserServer(id: string, path: string, name: string): GlobalWrite {
+/** Remove one user-scope server from `~/.claude.json`, leaving everything else; `keep` spares an entry it accepts. */
+function dropUserServer(id: string, path: string, name: string, keep?: (entry: unknown) => boolean): GlobalWrite {
   try {
     const loaded = readJsonObject(path);
     if (loaded === 'unparseable') return { id, path, action: 'skipped-unparseable' };
     const servers = loaded.root.mcpServers;
     if (!servers || typeof servers !== 'object' || !(name in servers)) return { id, path, action: 'unchanged' };
+    if (keep?.(servers[name])) return { id, path, action: 'unchanged' };
     delete servers[name];
     writeFileSync(path, `${JSON.stringify(loaded.root, null, 2)}\n`);
     return { id, path, action: 'updated' };
@@ -214,4 +216,62 @@ export function fitTrailServerToMachine(home: string, folder: string, has: { tra
   } catch {
     return { id, path, action: 'skipped-unparseable' };
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* the workspace's tools and skills, for Claude Code                          */
+/* -------------------------------------------------------------------------- */
+
+/** The flag that makes `trail mcp` serve only the workspace's tools (named before they were more than brains). */
+export const BRAINS_FLAG = '--brains';
+
+/** Whether a user-scope `trail` entry is the workspace-only server (`trail mcp --brains`). */
+export function isBrainsServer(entry: unknown): boolean {
+  const args = (entry as { args?: unknown } | null)?.args;
+  return Array.isArray(args) && args.includes(BRAINS_FLAG);
+}
+
+/**
+ * Once this machine is connected to a Trail workspace, Claude Code gets one
+ * `trail` entry at the user MCP scope (`~/.claude.json`, every project): a
+ * server that passes the workspace's own MCP server through (its tools,
+ * prompts and instructions; see mcp/connector.ts). trail gives Claude
+ * Code no repo-tools server (its hooks and the `trail` command do that work),
+ * so this one lists the workspace's tools and nothing else. Best-effort.
+ */
+export function installBrainsServer(home: string): GlobalWrite {
+  const id = 'claude-global-brains';
+  const path = join(home, '.claude.json');
+  try {
+    const { command, args } = serverEntry({ brand: 'trail' });
+    return mergeJsonKey(id, path, 'mcpServers', { command, args: [...args, BRAINS_FLAG] }, 'trail');
+  } catch {
+    return { id, path, action: 'skipped-unparseable' };
+  }
+}
+
+/** Take the workspace server out again (`trail logout`). Leaves any other `trail` entry alone. */
+export function removeBrainsServer(home: string): GlobalWrite {
+  return dropUserServer('claude-global-brains', join(home, '.claude.json'), 'trail', (e) => !isBrainsServer(e));
+}
+
+/**
+ * The same workspace-only server for Cursor, in its user-level
+ * `~/.cursor/mcp.json`, so every project opened in Cursor has the workspace's
+ * tools. A repo's own `.cursor/mcp.json` entry (from `trail init`) wins there.
+ */
+export function installCursorBrainsServer(home: string): GlobalWrite {
+  const id = 'cursor-global-brains';
+  const path = join(home, '.cursor', 'mcp.json');
+  try {
+    const { command, args } = serverEntry({ brand: 'trail' });
+    return mergeJsonKey(id, path, 'mcpServers', { command, args: [...args, BRAINS_FLAG] }, 'trail');
+  } catch {
+    return { id, path, action: 'skipped-unparseable' };
+  }
+}
+
+/** Take Cursor's workspace server out again (`trail logout`). */
+export function removeCursorBrainsServer(home: string): GlobalWrite {
+  return dropUserServer('cursor-global-brains', join(home, '.cursor', 'mcp.json'), 'trail', (e) => !isBrainsServer(e));
 }

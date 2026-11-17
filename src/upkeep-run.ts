@@ -5,11 +5,10 @@
  * writes, no spawning): this file is the only place that knows how to actually
  * re-run the wiring, and it is deliberately thin.
  */
-import { spawn } from 'node:child_process';
 import { runInit, wiringName } from './claude/init.js';
 import { runHostsInit } from './hosts/init.js';
 import { graftCliPath } from './claude/paths.js';
-import { BRAND_ENV, repoWiredForTrail, setBrand, trailOnPath } from './brand.js';
+import { repoWiredForTrail, setBrand, trailOnPath } from './brand.js';
 import { ensureRepoHome } from './notes/home.js';
 import { ensureRepoTrail } from './notes/repo-trail.js';
 import {
@@ -56,13 +55,13 @@ function rewriteWiring(repo: string, hosts: string[], opts: WiringOpts, toTrail 
   // its `~/.claude` writes (hosts/claude-global.ts) are out-of-repo, and a user who
   // declined those at init time must keep declining them on every replay.
   if (hosts.includes('claude'))
-    runInit(repo, { build: false, cliPath: graftCliPath(), statusline: opts.statusline, global: opts.global, ...(toTrail ? { brand: 'trail' as const } : {}) });
+    runInit(repo, { build: false, cliPath: graftCliPath(), statusline: opts.statusline, global: opts.global && (!opts.laptop || opts.laptop.includes('claude')), ...(toTrail ? { brand: 'trail' as const } : {}) });
   // The other agents move with Claude Code: their graft-named files and
   // fenced blocks are replaced by trail's (see hosts/init.ts).
   const others = hosts.filter((h) => h !== 'claude');
   if (others.length)
-    runHostsInit(repo, { agents: others, global: opts.global, mcp: opts.mcp, hooks: opts.hooks, ...(toTrail ? { brand: 'trail' as const } : {}) });
-  if (toTrail && hosts.includes('claude')) readPastSessionsInBackground(repo);
+    runHostsInit(repo, { agents: others, global: opts.global, laptop: opts.laptop, mcp: opts.mcp, hooks: opts.hooks, ...(toTrail ? { brand: 'trail' as const } : {}) });
+  // Past sessions are never read here: only `trail init`, where the person sees what was found and picks.
 }
 
 /**
@@ -75,25 +74,6 @@ export function shouldMoveToTrail(repo: string, env: NodeJS.ProcessEnv = process
   if (env.GRAFT_NO_TRAIL_SWITCH === '1') return false;
   // Claude Code's wiring is what says a repo is on trail, so only a repo with it moves.
   return wiredHostIds(repo).includes('claude') && !repoWiredForTrail(repo) && trailOnPath(env);
-}
-
-/**
- * `trail init`'s first read of past sessions, for a repo that moved at session
- * start: it takes about a minute, so a detached child does it, and what it
- * learns is there from the next session.
- */
-function readPastSessionsInBackground(repo: string): void {
-  try {
-    const child = spawn(process.execPath, [graftCliPath(), '_trail-past-read', repo], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-      env: { ...process.env, [BRAND_ENV]: 'trail' },
-    });
-    child.unref();
-  } catch {
-    // `trail init` in the repo reads them instead.
-  }
 }
 
 /**

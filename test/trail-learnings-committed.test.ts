@@ -69,7 +69,7 @@ test("counted when committed learnings go up, not when they stay the same", () =
   assert.ok(sent()[1]!.properties.total_bucket);
 });
 
-test("uncommitted team learnings are mentioned once a day, naming who'd get them", async () => {
+test("uncommitted repo learnings are mentioned once a day, naming who'd get them", async () => {
   const { uncommittedDirective } = await import("../src/claude/hooks.js");
   const d = tmpRepo("uncommitted");
   git(d, ["init", "-q", "-b", "main"]);
@@ -83,8 +83,26 @@ test("uncommitted team learnings are mentioned once a day, naming who'd get them
   mkdirSync(join(d, ".trail", "learnings"), { recursive: true });
   writeFileSync(join(d, ".trail", "learnings", "x.md"), "---\ntitle: x\n---\n");
   const said = uncommittedDirective(d);
-  assert.match(said, /1 team learning in \.trail\/learnings\/ isn't committed yet/);
+  assert.match(said, /1 learning added to this repo \(in \.trail\/learnings\/\) isn't committed yet, so no teammate's agent has it/);
+  assert.doesNotMatch(said, /team learning/, "learnings in .trail/learnings are repo learnings, added to this repo");
   assert.match(said, /🌱 Anay works in this repo\. Commit what you learned and their agents get to a PR 3x faster$/m);
   assert.equal(uncommittedDirective(d), "", "once a day");
-  assert.notEqual(uncommittedDirective(d, Date.now() + 25 * 3600_000), "", "and again the next day while it's still waiting");
+  const nextDay = Date.now() + 25 * 3600_000;
+  writeFileSync(join(d, ".trail", "learnings", "y.md"), "---\ntitle: y\n---\n");
+  assert.match(uncommittedDirective(d, nextDay), /2 learnings added to this repo \(in \.trail\/learnings\/\) aren't committed yet, so no teammate's agent has them/, "and again the next day while they're still waiting");
+});
+
+test("a Codex session's count is put down to Codex, as the hook names it", () => {
+  const d = tmpRepo("learnings-committed-codex");
+  git(d, ["init", "-q", "-b", "main"]);
+  commitLearning(d, "a.md");
+  const before = sent().length;
+  process.env.TRAIL_AGENT_HOST = "codex";
+  try {
+    trackLearningsCommitted(d);
+  } finally {
+    delete process.env.TRAIL_AGENT_HOST;
+  }
+  assert.equal(sent().length, before + 1);
+  assert.equal(sent().at(-1)!.properties.agent_host, "codex");
 });

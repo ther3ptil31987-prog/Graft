@@ -3,7 +3,8 @@
  * `callTool` never throws — hosts get soft errors as isError content.
  */
 import { Graft } from '../engine.js';
-import { formatAsk, skeleton, formatSkeleton } from '../ask/ask.js';
+import { join } from 'node:path';
+import { formatAsk, formatAskWithSaved, skeleton, formatSkeleton } from '../ask/ask.js';
 import { formatCheckReport } from '../context/check.js';
 import { formatGraphCheckReport } from '../graph/check.js';
 import { loadGraphCached } from '../graph/load.js';
@@ -26,6 +27,7 @@ import {
   readWorkspace,
 } from '../graph/workspace.js';
 import type { NodeV1 } from '../graph/types.js';
+import { recordLookup } from '../cloud/lookup-activity.js';
 import { canonicalToolName } from './tool-names.js';
 import { cmd } from '../brand.js';
 
@@ -204,6 +206,19 @@ async function callWorkspaceTool(
  * `graft_check_freshness` answer about a graph it just fixed, i.e. always "OK". */
 const NO_REFRESH_TOOLS = new Set(['graft_check_freshness']);
 
+/** A clean graph may intentionally omit supported languages. Keep that scope
+ * visible on every answer, including zero hits, without changing unfiltered replies. */
+function extensionScopeNote(root: string, override?: string, children?: string[]): string | null {
+  const scopes = children
+    ? children.map((child) => ({ label: `${child}/: `, outDir: contextDirFor(join(root, child)) }))
+    : [{ label: '', outDir: contextDirFor(root, override) }];
+  const graphs = scopes.map((scope) => ({ ...scope, graph: loadGraphCached(scope.outDir) }));
+  if (!graphs.some(({ graph }) => graph?.meta?.extensions?.length)) return null;
+  const selections = graphs.map(({ label, graph }) =>
+    label + (graph?.meta?.extensions?.join(', ') || (graph ? 'all supported' : 'not built')));
+  return `Indexed extensions: ${selections.join('; ')}. Use ordinary source search for files outside these selections.`;
+}
+
 /**
  * The pre-0.8.1 tool names, still accepted, live in the dependency-free
  * `tool-names.ts` (shared with the engine-free session hooks). The names were the
@@ -239,7 +254,8 @@ export async function callTool(
     }
     const fed = ws ? await callWorkspaceTool(root, dirOverride, name, args) : null;
     const res = fed ?? (await callSingleTool(root, name, args, dirOverride));
-    return note ? { ...res, text: `${note}\n${res.text}` } : res;
+    const notes = [note, extensionScopeNote(root, dirOverride, ws?.children)].filter(Boolean);
+    return notes.length ? { ...res, text: `${notes.join('\n')}\n${res.text}` } : res;
   } catch (err) {
     return { text: err instanceof Error ? err.message : String(err), isError: true };
   }
@@ -260,7 +276,11 @@ async function callSingleTool(
         const engine = new Graft({ contextDir: dirOverride });
         const inArg = typeof args.in === 'string' && args.in ? args.in : undefined;
         const r = engine.ask(root, query, { limit, source: true, full: args.full === true, in: inArg });
-        return { text: formatAsk(r), isError: false };
+        // Same event the CLI's `ask` reports: the learnings shown and the tokens saved.
+        // One render serves both the answer and the saving the event reports.
+        const { text, savedTokens } = formatAskWithSaved(r);
+        recordLookup(r, root, undefined, savedTokens);
+        return { text, isError: false };
       }
       case 'graft_file_api': {
         const file = String(args.file ?? '');

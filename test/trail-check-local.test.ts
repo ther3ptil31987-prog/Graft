@@ -350,14 +350,14 @@ test("no candidates, no findings", () => {
 /* the live demo: hashicorp/go-retryablehttp                                  */
 /* -------------------------------------------------------------------------- */
 
-const DEMO_NOTE_PATH = "/Users/anirudh/.trail/repos/hashicorp-go-retryablehttp/notes/2026-10-08-keep-the-default-retry-count-at-4-anirudh.md";
+const DEMO_NOTE_PATH = "/Users/maya/.trail/repos/hashicorp-go-retryablehttp/notes/2026-10-08-keep-the-default-retry-count-at-4-maya.md";
 const DEMO_DECIDED = "Keep defaultRetryMax = 4: ten retries with the default backoff can hold one Do() call for over an hour.";
 
 function demoNote(): Note {
   return note({
     path: DEMO_NOTE_PATH,
     title: "Keep the default retry count at 4",
-    author: "Anirudh",
+    author: "Maya",
     date: "2026-10-08",
     touches: ["client.go"],
     body: [
@@ -392,7 +392,7 @@ function demoDiff(from: string, to: string): string {
   ].join("\n");
 }
 
-test("demo: raising defaultRetryMax from 4 to 10 conflicts with Anirudh's decision", () => {
+test("demo: raising defaultRetryMax from 4 to 10 conflicts with Maya's decision", () => {
   const res = checkLocally({ diff: demoDiff("4", "10"), files: ["client.go"], notes: [demoNote()], skills: [], asker: "Kumar", now: new Date("2026-10-09T10:00:00Z") });
   assert.deepEqual(res, {
     files: 1,
@@ -407,7 +407,7 @@ test("demo: raising defaultRetryMax from 4 to 10 conflicts with Anirudh's decisi
         source: {
           kind: "note",
           title: "Keep the default retry count at 4",
-          author: "Anirudh",
+          author: "Maya",
           date: "2026-10-08",
           path: DEMO_NOTE_PATH,
           quote: DEMO_DECIDED,
@@ -422,5 +422,5 @@ test("demo: putting defaultRetryMax back to 4 follows the decision, without a li
   assert.equal(res.findings.length, 1);
   assert.equal(res.findings[0]!.verdict, "follows");
   assert.equal(res.findings[0]!.line, undefined);
-  assert.equal(res.findings[0]!.summary, "sets defaultRetryMax to 4, as Anirudh's learning says");
+  assert.equal(res.findings[0]!.summary, "sets defaultRetryMax to 4, as Maya's learning says");
 });

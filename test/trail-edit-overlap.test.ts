@@ -131,7 +131,9 @@ test("after the edit, the hook tells the agent about it once a session", async (
   const run = async (): Promise<string> => {
     let out = "";
     const write = process.stdout.write;
-    process.stdout.write = ((chunk: unknown) => ((out += String(chunk)), true)) as typeof process.stdout.write;
+    const pass = write.bind(process.stdout);
+    // The hook writes strings; the test runner's own reports (bytes, on Node 20) pass through.
+    process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => (typeof chunk === "string" ? ((out += chunk), true) : (pass as (...a: unknown[]) => boolean)(chunk, ...rest))) as typeof process.stdout.write;
     process.env.GRAFT_TEST_STDIN = JSON.stringify({ session_id: "s1", tool_name: "Edit", tool_input: edit });
     try {
       await main("post-edit");

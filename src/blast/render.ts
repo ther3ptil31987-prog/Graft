@@ -239,7 +239,7 @@ function tagLine(r: BlastReport): string | null {
   return `Tag: ${bits.join(" · ")}`;
 }
 
-/** `Shrish Dwivedi — 57 commits, last 9d ago`, for one cell of the table. */
+/** `Dana Reyes — 57 commits, last 9d ago`, for one cell of the table. */
 function ownerCell(owners: Owner[] | undefined, now: number): string {
   if (owners === undefined || owners.length === 0) {
     // Said in words rather than left blank: "nobody else" is a real answer, and an

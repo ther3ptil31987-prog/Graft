@@ -28,8 +28,8 @@ const repoShim = join(tmpdir(), "some-repo", ".claude", "helpers", "trail-hooks.
 
 test("the repo's copy stands down for an event the ~/.claude copy answers", () => {
   const { home } = homeWith(["session-start", "prompt"]);
-  assert.equal(globalCopyCovers("session-start", repoShim, home), true);
-  assert.equal(globalCopyCovers("prompt", repoShim, home), true);
+  assert.equal(globalCopyCovers("session-start", repoShim, home, {}), true);
+  assert.equal(globalCopyCovers("prompt", repoShim, home, {}), true);
   assert.equal(globalCopyCovers("stop", repoShim, home), false, "an event only the repo registers still runs there");
 });
 
@@ -56,4 +56,13 @@ test("no ~/.claude settings, or none of ours: the repo's copy runs", () => {
   writeFileSync(join(home, ".claude", "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ hooks: [{ command: "echo hi" }] }] } }));
   assert.equal(globalCopyCovers("session-start", repoShim, home), false);
   assert.equal(globalCopyCovers("session-start", undefined, home), false);
+});
+
+test("with CLAUDE_CONFIG_DIR elsewhere, Claude Code never runs the ~/.claude copy, so the repo's answers", () => {
+  const { home } = homeWith(["session-start", "pre-bash"]);
+  const elsewhere = mkdtempSync(join(tmpdir(), "hook-layers-config-"));
+  assert.equal(globalCopyCovers("session-start", repoShim, home, { CLAUDE_CONFIG_DIR: elsewhere }), false);
+  assert.equal(globalCopyCovers("pre-bash", repoShim, home, { CLAUDE_CONFIG_DIR: elsewhere }), false);
+  assert.equal(globalCopyCovers("session-start", repoShim, home, { CLAUDE_CONFIG_DIR: join(home, ".claude") }), true, "pointing at ~/.claude itself changes nothing");
+  assert.equal(globalCopyCovers("session-start", repoShim, home, {}), true);
 });

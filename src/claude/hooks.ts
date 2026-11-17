@@ -1,44 +1,60 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
-import { join, basename, isAbsolute, relative, resolve } from 'node:path';
+import { join, basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { readWiring } from './stats.js';
-import { formatBlastRadius, relevantRetrieval, formatOrientation, notesForPrompt, notesOnTouch, standingDirective, type Touch } from './format.js';
+import { formatBlastRadius, formatOrientation, notesOnTouch, standingDirective, teamNotesDirective, TOUCH_NOTES_CAP, type Touch } from './format.js';
 import { commitLines, listNotes, setupCommitLine, standingLearnings } from '../notes/notes.js';
+import { liveLearnings } from '../notes/learning-fields.js';
+import { markStale } from '../notes/stale.js';
 import { noteAuthor, teammatesOn } from '../notes/git-facts.js';
 import { indexFreshness, staleBanner } from '../context/check.js';
-import { patchStats, readStats, acquireLock, readSession, writeSession, resolveContextDir } from './state.js';
-import { graftCliPath, claudeScriptPath } from './paths.js';
+import { dropStoredPrompts, patchStats, readSession, writeSession, resolveContextDir } from './state.js';
+import { emit, emitHook, payloadSessionId } from './hook-io.js';
+import { maybeShareSyncInBackground } from '../cloud/share-sync-state.js';
+import { claudeScriptPath } from './paths.js';
+import { codexPostBashPart, postBashPart, sessionStartPart } from './skills-wiring.js';
+import { handlePrompt } from './prompt-hook.js';
 import { runUpkeep } from '../upkeep-run.js';
 import { runningVersion, wiredHostIds } from '../upkeep.js';
 import { hostsWiredForTrail } from '../hosts/registry.js';
+import { isJustMe, JUST_ME_DIRECTIVE } from '../notes/just-me.js';
 import { flushClosedSessions, summarizeSession } from '../telemetry/sessions.js';
 import { maybeFlushInBackground } from '../telemetry/flush.js';
-import { hasSavingsTally, lastAssistantTurn, lastTurnBilling } from './tally.js';
-import { scopeOf, scopesOfGraph } from '../graph/scopes.js';
+import { handleStopEvent } from './stop.js';
+import { main as preBashMain } from './pre-bash.js';
 import { classifyToolUse, commandInvokesGraft, isMcpToolName, isGraftMcpTool, parseSavings, recordToolUse, type ToolKind } from './session-metrics.js';
-import { adoptRepoBrand, brand, cmd, commandOnPath, repoWiredForTrail, tag, trailHandoverLine, trailOnPath } from '../brand.js';
+import { adoptRepoBrand, brand, commandOnPath, repoWiredForTrail, tag, trailHandoverLine, trailOnPath } from '../brand.js';
 import { fitTrailServerToMachine } from '../hosts/claude-global.js';
 import { globalCopyCovers } from './hook-layers.js';
-import { NOTE_CALL } from '../notes/session-cost.js';
-import { keepsNotes, noteCount, repoPlace } from '../notes/home.js';
+import { checkoutRoot, keepsNotes, noteCounts, repoPlace, type NoteCounts } from '../notes/home.js';
 import { branchesStale, overlapMark, readBranchCache, refreshBranches, SESSION_REFRESH_MS } from '../notes/branches.js';
 import { learningFiles } from '../notes/repo-trail.js';
 import { inWorkspace, maybeSyncInBackground } from '../cloud/workspace-sync.js';
+import { hookNotice } from '../cloud/nudge.js';
 import { cacheDir, readJson, writeJsonAtomic } from '../util/state.js';
-import { countBucket } from '../telemetry/contract.js';
-import { track } from '../telemetry/track.js';
+import { countBucket, type AgentHost } from '../telemetry/contract.js';
+import { detectHost } from '../trace/host.js';
+import type { HookOut } from '../skills/types.js';
+import { claudeHost, HOST_ENV, track } from '../telemetry/track.js';
 import { skillsDirective } from '../skills/skills.js';
+import { everyRepoLearnings } from '../notes/every-repo.js';
+import type { Note } from '../notes/notes.js';
+import { hostFacts } from '../skills/host-facts.js';
+import { trailNow } from '../skills/settings.js';
+import { recordSkillUse, skillOfToolUse } from './skill-use.js';
+import { keptContext, keptNotice } from './start-init.js';
+import { teamSignInLine } from '../cloud/team-file.js';
 
-/** Prompts shorter than this never trigger retrieval — they are almost always
- * conversational ("yes go ahead", "thanks") and the coverage gate can't judge
- * them reliably with so few terms. */
-const MIN_PROMPT_CHARS = 12;
+export { lastFileScopeHint, promptAskTimeout } from './prompt-hook.js';
 
 function readStdin(): any {
   const seam = process.env.GRAFT_TEST_STDIN;
   const raw = seam !== undefined ? seam : safeReadFd0();
-  try { return JSON.parse(raw); } catch { return {}; }
+  try {
+    const input = JSON.parse(raw);
+    return input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  } catch { return {}; }
 }
 function safeReadFd0(): string { try { return readFileSync(0, 'utf8'); } catch { return ''; } }
 
@@ -50,131 +66,20 @@ export function underGraft(dir: string, file: string): boolean {
   const posix = rel.replace(/^[/\\]+/, '').replace(/\\/g, '/');
   return posix.startsWith('graft/') || posix.startsWith('.trail/cache/');
 }
-/** Default budget for a graft child process invoked from a hook, matching the 8s
- * the installed hook entries carry. */
-const CHILD_TIMEOUT_MS = 8000;
-/** Headroom left for the hook's own work (read stdin, score, write session, emit)
- * after its `graft ask` child returns. */
-const HOOK_OVERHEAD_MS = 2000;
-/** Floor, so a hand-edited tiny timeout can't leave the child no time at all. */
-const MIN_CHILD_TIMEOUT_MS = 4000;
-
 /**
- * How long the prompt hook may let `graft ask` run — derived from the budget that is
- * *actually installed* in this repo's `.claude/settings.json`, not from what the
- * current version of `settings-merge.ts` would install.
- *
- * A query now brings the graph up to date first, so `graft init` raises the
- * UserPromptSubmit budget to 15s to cover the one cold rebuild after an upgrade. But
- * `mergeGraftSettings` only runs during `graft init` — upgrading the npm package does
- * not re-run it. So every repo wired before that change keeps `"timeout": 8000`, and
- * hard-coding a 13s child there means Claude Code kills the hook first: `emit()` and
- * `writeSession()` never run, the turn gets no retrieval pack at all, and the SIGKILLed
- * child can't even release the build lock. Reading the installed number keeps the child
- * strictly inside whatever budget this repo really has.
+ * Count stale nodes for the statusline in a detached child (stale-count-run.js)
+ * instead of blocking the edit on `graft check`, which on a mid-size repo takes
+ * longer than any budget a per-edit hook can afford (#483). The child writes the
+ * count back when it finishes. GRAFT_TEST_STALE_COUNT_RUN is a test seam, like
+ * GRAFT_TEST_SYNC_RUN in stop.ts.
  */
-export function promptAskTimeout(dir: string): number {
-  const installed = installedHookTimeout(dir, 'UserPromptSubmit');
-  if (installed === null) return CHILD_TIMEOUT_MS - HOOK_OVERHEAD_MS;
-  return Math.max(MIN_CHILD_TIMEOUT_MS, installed - HOOK_OVERHEAD_MS);
-}
-
-/**
- * Every settings file Claude Code merges hook definitions from, for a session
- * rooted at `dir`. The per-repo file is not the only place graft's hooks can be
- * installed: declaring them once at the user level wires every repo on the
- * machine at once, and such a repo has no `.claude/settings.json` at all.
- */
-function hookSettingsFiles(dir: string): string[] {
-  const user = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
-  return [
-    join(dir, '.claude', 'settings.json'),
-    join(dir, '.claude', 'settings.local.json'),
-    join(user, 'settings.json'),
-  ];
-}
-
-/** The timeout on one settings file's graft hook entry for `event`, or null if it
- * can't be read (no settings file, hand-edited shape, unparseable JSON). */
-function hookTimeoutIn(file: string, event: string): number | null {
+function staleCountInBackground(dir: string): void {
+  const runner = process.env.GRAFT_TEST_STALE_COUNT_RUN ?? claudeScriptPath('stale-count-run.js');
+  if (!existsSync(runner)) return;
   try {
-    const settings = JSON.parse(readFileSync(file, 'utf8')) as any;
-    const blocks = settings?.hooks?.[event];
-    if (!Array.isArray(blocks)) return null;
-    for (const block of blocks) {
-      for (const h of block?.hooks ?? []) {
-        if (typeof h?.command === 'string' && /(graft|trail)-hooks\.cjs/.test(h.command) && typeof h.timeout === 'number') {
-          return h.timeout;
-        }
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
+    spawn(process.execPath, [runner, dir], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  } catch { /* a missed count costs a statusline number, never the edit */ }
 }
-
-/**
- * The budget this hook is actually running under, or null when no settings file
- * declares one.
- *
- * The smallest declared timeout wins rather than the nearest, because when more
- * than one file declares the hook Claude Code runs every matching entry and this
- * process cannot tell which one launched it. Guessing high is the expensive
- * mistake: an overrunning child gets the whole hook SIGKILLed, so `emit()` and
- * `writeSession()` never run and the turn silently gets no retrieval at all.
- * Guessing low only shortens one query.
- */
-function installedHookTimeout(dir: string, event: string): number | null {
-  let smallest: number | null = null;
-  for (const file of hookSettingsFiles(dir)) {
-    const timeout = hookTimeoutIn(file, event);
-    if (timeout === null) continue;
-    if (smallest === null || timeout < smallest) smallest = timeout;
-  }
-  return smallest;
-}
-
-/**
- * Append `--dir <contextDir>` for the hooks' own `graft ask`/`graft check`
- * children — the one place in this file that spawns the CLI itself rather
- * than reading `graft/` off disk (which already resolves through
- * `resolveContextDir` inside `util/state.ts` and `claude/stats.ts`). A no-op
- * when `GRAFT_DIR` isn't set, so an unconfigured repo's spawned CLI sees
- * byte-identical argv to before this existed.
- */
-function withContextDirArg(dir: string, args: string[]): string[] {
-  return process.env.GRAFT_DIR ? [...args, '--dir', resolveContextDir(dir)] : args;
-}
-
-function graftJson(dir: string, args: string[], timeout: number = CHILD_TIMEOUT_MS): any | null {
-  try {
-    // GRAFT_TEST_CLI is a test seam (mirrors GRAFT_TEST_STDIN/GRAFT_TEST_SYNC_RUN) so
-    // tests can point the prompt hook's `graft ask`/`graft check` calls at a stub
-    // script and observe the exact args it was invoked with, instead of shelling
-    // out to the real CLI (which isn't built relative to the TS source under test).
-    const cliPath = process.env.GRAFT_TEST_CLI ?? graftCliPath();
-    const out = execFileSync(process.execPath, [cliPath, ...args],
-      { cwd: dir, encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] });
-    return JSON.parse(out);
-  } catch (e: any) {
-    // `graft check` exits non-zero when the graph is stale (by design) but still
-    // prints valid JSON to stdout; recover it from the thrown error before giving up.
-    if (e && typeof e.stdout === 'string' && e.stdout.trim()) {
-      try { return JSON.parse(e.stdout); } catch { /* not JSON — fall through */ }
-    }
-    return null;
-  }
-}
-function checkStaleCount(dir: string): number {
-  const r = graftJson(dir, withContextDirArg(dir, ['check', '.', '--json']));
-  const g = r?.graph ?? {};
-  return (g.changed?.length ?? 0) + (g.added?.length ?? 0) + (g.removed?.length ?? 0);
-}
-function emit(eventName: string, additionalContext: string): void {
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: eventName, additionalContext } }));
-}
-
 /**
  * The absolute path of the file a PostToolUse edit touched, across host edit-tool
  * shapes:
@@ -201,7 +106,8 @@ export function editedFilePath(input: any, dir: string): string | null {
 async function handlePostEdit(input: any, dir: string): Promise<void> {
   const file = editedFilePath(input, dir);
   if (!file || underGraft(dir, file)) return;
-  patchStats(dir, { dirty: true, staleCount: checkStaleCount(dir), lastFile: basename(file) });
+  patchStats(dir, { dirty: true, lastFile: basename(file) });
+  staleCountInBackground(dir);
   const out: string[] = [];
   const w = readWiring(dir);
   if (w) { const br = formatBlastRadius(w, file); if (br) out.push(br); }
@@ -245,48 +151,6 @@ async function editOverlap(input: any, dir: string, file: string): Promise<strin
 }
 
 /**
- * The "you're working in backend/, weight it" hint: on a multi-scope repo,
- * narrow the prompt hook's `ask` call to whatever scope the last-edited file
- * (`stats.lastFile`, captured at {@link handlePostEdit}) sits in.
- *
- * `lastFile` is only a basename (not a repo-relative path — see
- * `handlePostEdit`), so this is a best-effort lookup against the CURRENT
- * graph: any file node whose path ends in `/<lastFile>` (or equals it, for a
- * repo-root file). Fails soft in every direction a hook must never crash on —
- * no graph, a single-scope graph, a lastFile no longer in the graph (moved,
- * deleted, or edited before the first build), or a basename that lands in
- * more than one scope (ambiguous: could be either sub-project) all skip the
- * hint silently, logging one line to stderr so the miss is visible without
- * ever failing the hook.
- */
-export function lastFileScopeHint(dir: string, lastFile: string | null | undefined): string | null {
-  if (!lastFile) return null;
-  try {
-    const w = readWiring(dir);
-    if (!w) return null;
-    const scopes = scopesOfGraph(w);
-    if (scopes.length <= 1) return null; // single-scope: no hint, no --in
-    const matches = (w.nodes ?? []).filter(
-      (n) => n.kind === 'file' && (n.path === lastFile || n.path.endsWith(`/${lastFile}`)),
-    );
-    if (matches.length === 0) {
-      console.error(`${tag()} prompt hook: lastFile "${lastFile}" not found in the graph — skipping scope hint`);
-      return null;
-    }
-    const prefixes = new Set(matches.map((n) => scopeOf(n.path, scopes).prefix));
-    if (prefixes.size > 1) {
-      console.error(`${tag()} prompt hook: lastFile "${lastFile}" matches more than one scope — skipping scope hint`);
-      return null;
-    }
-    const [prefix] = prefixes;
-    return prefix === '' ? null : prefix; // root scope: nothing to narrow
-  } catch (e: any) {
-    console.error(`${tag()} prompt hook: scope hint lookup failed (${e?.message ?? e}) — skipping`);
-    return null;
-  }
-}
-
-/**
  * PostToolUse on a retrieval tool. Two jobs, both a pure parse of the payload the
  * hook already received (no re-run):
  *
@@ -306,10 +170,27 @@ export function lastFileScopeHint(dir: string, lastFile: string | null | undefin
  * nothing is written.
  */
 function handleToolUse(input: any, dir: string): void {
-  recordToolUse(dir, input?.session_id || 'default',
-    { ...classifyAndScore(input?.tool_name, input?.tool_input?.command, () => input?.tool_response ?? input), host: 'claude-code' });
-  const learned = learningsOnTouch(input, dir);
-  if (learned) emit('PostToolUse', learned);
+  recordToolUse(dir, payloadSessionId(input),
+    { ...classifyAndScore(input?.tool_name, input?.tool_input?.command, () => input?.tool_response ?? input), host: telemetryHost(input) });
+}
+
+/** The repo's shared git dir (`git rev-parse --git-common-dir`) for the checkout at `cwd`, resolved; null outside git. */
+function commonGitDir(cwd: string): string | null {
+  try {
+    const out = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true,
+    }).trim();
+    return out ? realpathSync(out) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `checkout` is the project at `dir` itself, or a linked worktree of the same repo. Git runs only when it's another folder. */
+function sameRepo(checkout: string, dir: string): boolean {
+  if (resolve(checkout) === checkoutRoot(dir)) return true;
+  const theirs = commonGitDir(checkout);
+  return theirs !== null && theirs === commonGitDir(dir);
 }
 
 /**
@@ -318,30 +199,67 @@ function handleToolUse(input: any, dir: string): void {
  * each once a session. A trail command is skipped: its own output already
  * carries the learnings that bear on it. Never throws.
  */
-export function learningsOnTouch(input: any, dir: string): string | null {
+export function learningsOnTouch(input: any, dir: string, before = false): string | null {
   try {
     if (brand() !== 'trail' || !keepsNotes(dir)) return null;
     const ti = input?.tool_input ?? {};
     const path = typeof ti.file_path === 'string' ? ti.file_path : typeof ti.notebook_path === 'string' ? ti.notebook_path : null;
     let touch: Touch;
     if (path) {
-      const rel = relative(dir, isAbsolute(path) ? path : join(dir, path)).replace(/\\/g, '/');
+      const abs = isAbsolute(path) ? path : join(dir, path);
+      // In a Claude Desktop worktree session the project is the main checkout and the file is in
+      // the worktree: its path in its own checkout is what a learning's touches name. Only a
+      // checkout of this same repo, though: a file in an unrelated repo is no file of the project's.
+      const own = checkoutRoot(dirname(abs));
+      const rel = relative(own && sameRepo(own, dir) ? own : dir, abs).replace(/\\/g, '/');
       if (!rel || rel.startsWith('..') || underGraft(dir, path)) return null;
-      touch = { file: rel, verb: input?.tool_name === 'Read' ? 'opened' : 'changed' };
+      touch = { file: rel, verb: before ? 'editing' : input?.tool_name === 'Read' ? 'opened' : 'changed' };
     } else if (typeof ti.command === 'string' && ti.command && !commandInvokesGraft(ti.command)) {
       touch = { command: ti.command };
     } else return null;
-    const notes = listNotes(dir, { branches: false });
+    const notes = liveLearnings(listNotes(dir, { branches: false }));
     if (!notes.length) return null;
-    const id = input?.session_id || 'default';
+    const id = payloadSessionId(input);
     const s = readSession(dir, id);
-    const text = notesOnTouch(notes, touch, s);
+    const text = notesOnTouch(notes, touch, s, TOUCH_NOTES_CAP, dir);
+    // notesOnTouch added what they saved to the session's counter.
     if (text) writeSession(dir, id, s);
     return text;
   } catch {
     // A learning that doesn't arrive costs one reminder; a broken hook costs the turn.
     return null;
   }
+}
+
+/**
+ * PreToolUse on Write and Edit: the learnings on the file, before the agent
+ * changes it, while they can still change the edit. They're marked shown, so
+ * the PostToolUse after the edit doesn't repeat them. A teammate's learning
+ * just reached the agent, which is when the person gets the workspace link.
+ */
+export function handlePreEdit(input: any, dir: string): void {
+  const learned = learningsOnTouch(input, dir, true);
+  if (!learned) return;
+  const notice = hookNotice(dir, "Claude just got your team's learnings on the file it's changing", { session: payloadSessionId(input) }) ?? undefined;
+  emitHook('PreToolUse', { context: learned, notice });
+}
+
+/**
+ * PostToolUse's one answer: the skills part's, with the learnings about what
+ * the call touched added to its context. Two JSON objects on stdout would be
+ * read as neither. A block is the whole answer, so then no learning is used up.
+ */
+export function withTouchLearnings(out: HookOut, input: any, dir: string): HookOut {
+  if (out.block) return out;
+  const learned = learningsOnTouch(input, dir);
+  if (!learned) return out;
+  return { ...out, context: [out.context, learned].filter(Boolean).join('\n\n') };
+}
+
+/** Who to put a hook's events down to: Codex, Cursor and Copilot CLI run these hooks too. */
+function telemetryHost(input: unknown): AgentHost {
+  const host = detectHost(input).host;
+  return host === 'codex' || host === 'cursor' || host === 'copilot' ? host : claudeHost();
 }
 
 /**
@@ -399,166 +317,7 @@ function handleCursorMcp(input: any, dir: string): void {
 
 /** Cursor keys a chat by `conversation_id` (its `session_id` equivalent). */
 function cursorSessionId(input: any): string {
-  return input?.conversation_id || input?.session_id || 'default';
-}
-
-/**
- * At turn end: what did this turn's input tokens actually cost?
- *
- * Deliberately ungated, unlike {@link countTallyTurn}: the blended rate has to
- * describe the session, and graft turns are not a fair sample of it — they are
- * the long, tool-heavy, cache-warm ones. Sampling only those would report a
- * cheaper token than the session really pays.
- *
- * Accumulates the pair, never the ratio, so the rate re-blends every turn. A
- * turn already billed (a duplicate Stop, or a Stop racing the transcript write)
- * is skipped on its uuid.
- */
-function sampleTurnCost(input: any, dir: string): void {
-  try {
-    const id = input?.session_id || 'default';
-    const billing = lastTurnBilling(input?.transcript_path);
-    if (!billing) return;
-    const s = readSession(dir, id);
-    if (billing.uuid === s.lastBillingUuid) return;
-    s.inputCostMicros = (s.inputCostMicros ?? 0) + billing.costMicros;
-    s.inputTokensBilled = (s.inputTokensBilled ?? 0) + billing.tokens;
-    s.lastBillingUuid = billing.uuid;
-    writeSession(dir, id, s);
-  } catch {
-    // A billing estimate is never worth failing the graph sync over.
-  }
-}
-
-/**
- * At turn end: did the reply the user just read say what graft saved?
- *
- * Runs only on turns the tool-savings hook flagged, so a conversational turn
- * costs nothing. A turn we cannot observe — a host whose Stop hook names no
- * transcript, an unreadable file, or a Stop that fires before the final prose
- * is on disk — is counted in NEITHER total: the ratio these two numbers form
- * has to mean "of the turns we could check", not "of the turns we tried to".
- */
-function countTallyTurn(input: any, dir: string): void {
-  try {
-    const id = input?.session_id || 'default';
-    const s = readSession(dir, id);
-    if (!s.turnUsedGraft) return;
-    const turn = lastAssistantTurn(input?.transcript_path);
-    // Same reply as last time we looked: no new prose has landed, so this Stop
-    // is a duplicate or a race with the transcript write. Drop the turn rather
-    // than judge it on a stale message.
-    if (!turn || turn.uuid === s.lastTallyUuid) {
-      writeSession(dir, id, { ...s, turnUsedGraft: false });
-      return;
-    }
-    s.graftTurns = (s.graftTurns ?? 0) + 1;
-    if (hasSavingsTally(turn.text)) s.reportedTurns = (s.reportedTurns ?? 0) + 1;
-    s.turnUsedGraft = false;
-    s.lastTallyUuid = turn.uuid;
-    writeSession(dir, id, s);
-  } catch {
-    // A turn-end metric is never worth failing the graph sync over.
-  }
-}
-
-/** Tool calls in one turn before it counts as digging worth a note. */
-export const NOTE_WORTHY_CALLS = 3;
-
-/**
- * Reading that trail's answers stood in for, in one turn, before it counts as
- * digging too. trail answers most questions in one or two calls, so on calls
- * alone an exploratory turn never qualified and its findings were never saved.
- */
-export const NOTE_WORTHY_TOKENS = 30_000;
-
-/** The reading a query stood in for, from its `[trail] tokens saved ≈ N` line. A
- * reused learning's own line doesn't count: that digging was done before. */
-function codeReadIn(content: unknown): number {
-  const text = typeof content === 'string' ? content : Array.isArray(content) ? content.map((c: any) => (typeof c?.text === 'string' ? c.text : '')).join('\n') : '';
-  let total = 0;
-  for (const m of text.matchAll(/\[(?:graft|trail)\] tokens saved ≈ ([\d,]+)/g)) total += Number(m[1]!.replace(/,/g, '')) || 0;
-  return total;
-}
-
-/** What the agent is told when a turn took real digging and left no note. */
-export const NOTE_ASK =
-  '[trail] This took real digging and the session has saved no learning. Before you finish, save one for the next session: ' +
-  '`trail note --title "<what it was about>"` with the text on stdin, under ## Decided, ## Tried and ruled out and ## Watch out. ' +
-  "A summary, never a transcript, and nothing secret. If you've committed this work, commit the learning too. Then finish as trail's output asks, if it asks anything.";
-
-/**
- * Whether the turn that just ended deserves a note: since the person's last
- * message it made at least NOTE_WORTHY_CALLS tool calls, or trail's answers in
- * it stood in for at least NOTE_WORTHY_TOKENS of reading; and nothing in the
- * session has run `trail note` yet. Pure, for tests: `text` is the
- * transcript's JSONL.
- */
-export function turnWantsNote(text: string): boolean {
-  let calls = 0;
-  let codeRead = 0;
-  for (const line of text.split('\n')) {
-    if (!line.trim()) continue;
-    let e: any;
-    try {
-      e = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    const content = e?.message?.content;
-    const blocks: any[] = Array.isArray(content) ? content : [];
-    // A message the person typed starts a new turn; a tool result does not.
-    if (e?.type === 'user' && (typeof content === 'string' || blocks.some((b) => b?.type === 'text'))) {
-      calls = 0;
-      codeRead = 0;
-    }
-    for (const b of blocks) {
-      if (b?.type === 'tool_result') codeRead += codeReadIn(b.content);
-      if (b?.type !== 'tool_use') continue;
-      if (typeof b.input?.command === 'string' && NOTE_CALL.test(b.input.command)) return false;
-      calls++;
-    }
-  }
-  return calls >= NOTE_WORTHY_CALLS || codeRead >= NOTE_WORTHY_TOKENS;
-}
-
-/**
- * Under trail, a turn that took real digging and left no note is asked once
- * per session to leave one, by blocking the stop with the reason. The agent
- * then saves the note, and trail's output carries on from there (the sign-in
- * link, when one is due). Never blocks twice in a row: Claude Code sets
- * `stop_hook_active` on the stop that follows a block.
- */
-function askForNote(input: any, dir: string): void {
-  try {
-    if (brand() !== 'trail' || input?.stop_hook_active || !input?.transcript_path || !keepsNotes(dir)) return;
-    const id = input?.session_id || 'default';
-    const s = readSession(dir, id);
-    if (s.noteAsked) return;
-    if (!turnWantsNote(readFileSync(input.transcript_path, 'utf8'))) return;
-    writeSession(dir, id, { ...s, noteAsked: true });
-    process.stdout.write(JSON.stringify({ decision: 'block', reason: NOTE_ASK }));
-  } catch {
-    // A missed reminder costs one note; a broken Stop hook costs the session.
-  }
-}
-
-function handleStop(input: any, dir: string): void {
-  sampleTurnCost(input, dir);
-  countTallyTurn(input, dir);
-  // sync-run.js ships next to this module inside the package, so it resolves in
-  // any repo that installs graft (not just graft's own). Defensive existsSync:
-  // if the package is somehow incomplete, skip rather than wedge on syncing:true.
-  // GRAFT_TEST_SYNC_RUN is a test seam (mirrors GRAFT_TEST_STDIN) so tests can point
-  // this at a stub file inside their own sandbox instead of writing into src/claude/.
-  const syncRun = process.env.GRAFT_TEST_SYNC_RUN ?? claudeScriptPath('sync-run.js');
-  if (!existsSync(syncRun)) return;
-  const stats = readStats(dir);
-  if (stats?.dirty && acquireLock(dir)) {
-    patchStats(dir, { syncing: true });
-    const child = spawn(process.execPath, [syncRun, dir], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.unref();
-  }
+  return payloadSessionId({ session_id: input?.conversation_id || input?.session_id });
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -575,7 +334,7 @@ export function trackRepoSeen(dir: string, now = Date.now()): void {
     const mark = join(cacheDir(place.checkout), 'trail-repo-seen.json');
     if (now - (readJson<{ at?: number }>(mark)?.at ?? 0) < DAY_MS) return;
     writeJsonAtomic(mark, { at: now }, true);
-    const tracked = execFileSync('git', ['ls-files', '--', '.trail'], { cwd: place.checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
+    const tracked = execFileSync('git', ['ls-files', '--', '.trail'], { cwd: place.checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true });
     track(
       'repo_seen',
       { trail_committed: String(tracked.trim().length > 0), learnings_bucket: countBucket(learningFiles(place.checkout).length), workspace: String(inWorkspace(place.checkout)) },
@@ -598,7 +357,7 @@ export function trackLearningsCommitted(dir: string): void {
     const place = repoPlace(dir);
     if (!place.git) return;
     const listed = execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD', '--', '.trail/learnings'], {
-      cwd: place.checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000,
+      cwd: place.checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true,
     });
     const count = listed.split('\n').filter((f) => f.endsWith('.md')).length;
     const mark = join(cacheDir(place.checkout), 'trail-learnings-committed.json');
@@ -617,17 +376,20 @@ export function trackLearningsCommitted(dir: string): void {
 }
 
 /**
- * Team learnings sitting uncommitted in `.trail/learnings/` (from trail init's
+ * Learnings added to this repo but sitting uncommitted in `.trail/learnings/` (from trail init's
  * read of past sessions, or a session that ended before committing) reach no
  * teammate. Once a day per repo, the first reply says so, with the line that
- * makes the case for committing them. Empty when everything is committed.
+ * makes the case for committing them. Empty when everything is committed. In a
+ * repo on trail just for this person (notes/just-me.ts), every session is told
+ * instead that there is nothing to commit.
  */
 export function uncommittedDirective(dir: string, now = Date.now()): string {
   try {
     const place = repoPlace(dir);
     if (!place.git) return '';
+    if (isJustMe(place.checkout)) return `${tag()} ${JUST_ME_DIRECTIVE}\n`;
     const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all', '--', '.trail/learnings'], {
-      cwd: place.checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000,
+      cwd: place.checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true,
     });
     const n = status.split('\n').filter((l) => l.trimEnd().endsWith('.md')).length;
     const setup = setupUncommitted(place.checkout);
@@ -640,8 +402,8 @@ export function uncommittedDirective(dir: string, now = Date.now()): string {
       return `${tag()} trail's shared setup here (.trail/ and .claude/settings.json) isn't committed yet, so teammates' Claude can't read the learnings. Say so once, at the end of your first reply, with this line, word for word: ${line}\n`;
     }
     const line = commitLines({}, teammatesOn(place.checkout), 'repo').uncommitted;
-    const them = n === 1 ? "learning in .trail/learnings/ isn't committed yet, so no teammate's agent has it" : `learnings in .trail/learnings/ aren't committed yet, so no teammate's agent has them`;
-    return `${tag()} ${n} team ${them}. Say so once, at the end of your first reply, with this line, word for word: ${line}\n`;
+    const them = n === 1 ? "learning added to this repo (in .trail/learnings/) isn't committed yet, so no teammate's agent has it" : "learnings added to this repo (in .trail/learnings/) aren't committed yet, so no teammate's agent has them";
+    return `${tag()} ${n} ${them}. Say so once, at the end of your first reply, with this line, word for word: ${line}\n`;
   } catch {
     return '';
   }
@@ -654,7 +416,7 @@ export function uncommittedDirective(dir: string, now = Date.now()): string {
  */
 export function setupUncommitted(checkout: string): boolean {
   if (!existsSync(join(checkout, '.trail', 'hook.cjs'))) return false;
-  const git = (args: string[]) => execFileSync('git', args, { cwd: checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 });
+  const git = (args: string[]) => execFileSync('git', args, { cwd: checkout, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, windowsHide: true });
   try {
     git(['ls-files', '--error-unmatch', '--', '.trail/hook.cjs']);
   } catch {
@@ -692,6 +454,77 @@ function trailAtStart(dir: string): void {
   trackLearningsCommitted(dir);
 }
 
+/** What the session-start text says about learnings, read once. */
+interface StartLearnings {
+  /** This repo keeps learnings on this machine. */
+  kept: boolean;
+  count: number | NoteCounts;
+  /** The skills line, plus under trail the standing learnings and the uncommitted line. */
+  extra: string;
+}
+
+/**
+ * The learnings part of the session-start text. It needs nothing from
+ * `graft/`: the learnings are their own files. Empty on any read failure,
+ * which costs the session its learnings, never its start.
+ */
+function learningsAtStart(dir: string): StartLearnings {
+  // 1b (P21, J16): every-repo personal learnings load in every repo, a plain one too, skills on or off; never a
+  // lesson (R47: everyRepoLearnings leaves them out). Shown as standing learnings, phase 0's framing.
+  let every: Note[] = [];
+  try { every = everyRepoLearnings(); } catch { /* none this time */ }
+  try {
+    if (!keepsNotes(dir)) return { kept: false, count: 0, extra: standingDirective(every) };
+    const skills = skillsDirective(dir);
+    const standing = brand() === 'trail' ? standingDirective(withEvery(markStale(standingLearnings(dir), dir), every)) + uncommittedDirective(dir) : standingDirective(every);
+    return { kept: true, count: noteCounts(dir), extra: skills + standing };
+  } catch {
+    return { kept: false, count: 0, extra: standingDirective(every) };
+  }
+}
+
+/** This repo's standing learnings, then the every-repo ones not already among them (by id). */
+function withEvery(here: Note[], every: Note[]): Note[] {
+  const ids = new Set(here.map((n) => n.id).filter(Boolean));
+  return [...here, ...every.filter((n) => !n.id || !ids.has(n.id))];
+}
+
+/**
+ * D87: what the person kept on `trail init`'s screen, named once at the next interactive startup or resume in that
+ * repo with its undo. Skills on or off. A notice where the host shows one, else context from Trail.
+ */
+function keptAtStart(input: any, dir: string): { notice?: string; context?: string } {
+  try {
+    const source = typeof input?.source === 'string' && input.source ? input.source : 'startup';
+    if (source !== 'startup' && source !== 'resume') return {};
+    if (typeof input?.agent_id === 'string' && input.agent_id) return {};
+    if (String(process.env.CLAUDE_CODE_ENTRYPOINT ?? '').startsWith('sdk')) return {};
+    const cwd = typeof input?.cwd === 'string' && input.cwd ? input.cwd : dir;
+    const line = keptNotice(repoPlace(cwd).key, process.env, trailNow(process.env));
+    if (!line) return {};
+    return hostFacts(process.env, detectHost(input).host).startNotice ? { notice: line } : { context: keptContext(line) };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The session-start text: the orientation from `graft/INDEX.md` with the
+ * learnings in it, or, where INDEX.md is missing (never built here; `graft/` is
+ * git-ignored, so a teammate's fresh clone has none), the learnings alone.
+ */
+function orientationAtStart(dir: string, learnings: StartLearnings): string {
+  try {
+    const idx = readFileSync(join(resolveContextDir(dir), 'INDEX.md'), 'utf8');
+    const banner = staleBanner(indexFreshness(dir)) ?? undefined;
+    // Where the map is: `.trail/cache/` in a repo on trail, `graft/` elsewhere (context/map-dir.ts).
+    const mapDir = relative(dir, resolveContextDir(dir)).split('\\').join('/') || 'graft';
+    return formatOrientation(idx, undefined, banner, learnings.count, learnings.kept, learnings.extra, mapDir);
+  } catch {
+    return learnings.kept ? `${tag()} ${teamNotesDirective(learnings.count, true)}${learnings.extra}` : learnings.extra;
+  }
+}
+
 /** The repo's committed `.mcp.json` still registers trail's server (set up before 0.23). */
 function repoNamesTrailServer(dir: string): boolean {
   try {
@@ -702,15 +535,30 @@ function repoNamesTrailServer(dir: string): boolean {
 }
 
 export async function main(event: string): Promise<void> {
+  // Shims before pre-bash.js existed send PreToolUse here: hand it straight
+  // over, before any of the work the other events share.
+  if (event === 'pre-bash') { await preBashMain(event); return; }
   // trail's own headless Claude calls (the first-run read of past sessions) run with this set.
   if (process.env.TRAIL_NO_HOOKS === '1') return;
-  // Registered in the repo and in ~/.claude, Claude Code runs both: one answers.
-  if (globalCopyCovers(event, process.argv[1])) return;
+  // The one user-level entry `trail share-session` adds: start the background send, nothing else.
+  if (event === 'share-sync') { maybeShareSyncInBackground(); return; }
   const input = readStdin();
+  // Registered in the repo and in ~/.claude, Claude Code runs both: one answers.
+  // Who sent the payload decides first: Copilot CLI runs only the repo's copy.
+  if (globalCopyCovers(event, process.argv[1], homedir(), process.env, input)) return;
+  // Every event this hook sends, and every trail command it starts, is put down to the agent that sent the payload.
+  process.env[HOST_ENV] = telemetryHost(input);
   const dir = projectDir(input);
+  // A failed Bash call (PostToolUseFailure, D34): the skills mark, and 1b's wall fix as its one answer, before any of
+  // the work the other events share.
+  if (event === 'post-bash-fail') { emitHook('PostToolUseFailure', await postBashPart(input, dir, true)); return; }
+  // Codex's PostToolUse on Bash, on every exit (3.4): the skills mark, and the wall fix where its context reaches the model.
+  if (event === 'codex-post-bash') { emitHook('PostToolUse', await codexPostBashPart(input, dir)); return; }
   adoptRepoBrand(dir, process.env, hostsWiredForTrail);
 
   if (event === 'session-start') {
+    // The skills part first, so nothing below can skip it (a repo with no graft/INDEX.md included).
+    const skills = await sessionStartPart(input, dir);
     // Before anything is emitted: refresh this repo's wiring if it was written by
     // an older graft, and pick up any cached "newer version on npm" answer.
     // background:false — the registry check stays off the network here; the CLI
@@ -725,33 +573,40 @@ export async function main(event: string): Promise<void> {
     // terminal never fires it) goes now. Once a day at most, never waited on.
     flushClosedSessions(dir);
     maybeFlushInBackground();
+    // Someone who said yes to `share-session --sync`: send what changed, from a detached child.
+    maybeShareSyncInBackground();
+    // Once per repo: older versions kept the prompt in each session file.
+    try { dropStoredPrompts(dir); } catch { /* tried again next session */ }
     trailAtStart(dir);
     // A repo on trail, opened on a machine that has graft but not the trail command.
     // Only while its .mcp.json still names a trail server: once it doesn't, trail: true takes back the stand-in.
     if (repoWiredForTrail(dir)) fitTrailServerToMachine(homedir(), resolve(dir), { trail: trailOnPath() || !repoNamesTrailServer(dir), graft: commandOnPath('graft') });
-    try {
-      const idx = readFileSync(join(resolveContextDir(dir), 'INDEX.md'), 'utf8');
-      const banner = staleBanner(indexFreshness(dir)) ?? undefined;
-      const kept = keepsNotes(dir);
-      const skills = kept ? skillsDirective(dir, cmd('graft skills show')) : '';
-      const underTrail = kept && brand() === 'trail';
-      const standing = underTrail ? standingDirective(standingLearnings(dir)) + uncommittedDirective(dir) : '';
-      const mapDir = relative(dir, resolveContextDir(dir)).split('\\').join('/') || 'graft';
-      const orientation = formatOrientation(idx, undefined, banner, noteCount(dir), kept, skills + standing, mapDir);
-      emit('SessionStart', upkeep.length ? `${upkeep.join('\n')}\n\n${orientation}` : orientation);
-    } catch {
-      // No INDEX.md (never built here). An upgrade nudge is still worth saying.
-      if (upkeep.length) emit('SessionStart', upkeep.join('\n'));
-    }
+    const text = orientationAtStart(dir, learningsAtStart(dir));
+    const kept = keptAtStart(input, dir);
+    // The skills context comes after the learnings; its notice is for the person.
+    // A repo whose team uses a Trail workspace, on a laptop not signed in to it: offered once a session.
+    const team = teamSignInLine(dir);
+    const out = [upkeep.join('\n'), text, team, skills.context, kept.context].filter(Boolean).join('\n\n');
+    const notice = [skills.notice, kept.notice].filter(Boolean).join('\n') || undefined;
+    emitHook('SessionStart', { context: out, notice });
     return;
   }
 
   // Claude closing: send the queue from a detached child, so quitting isn't slowed.
   if (event === 'session-end') { maybeFlushInBackground(); return; }
 
+  if (event === 'pre-edit') { handlePreEdit(input, dir); return; }
+
   if (event === 'post-edit') { await handlePostEdit(input, dir); return; }
 
-  if (event === 'tool-savings') { handleToolUse(input, dir); return; }
+  if (event === 'tool-savings') {
+    handleToolUse(input, dir);
+    recordSkillUse(skillOfToolUse(input), input, dir);
+    // PostToolUse on Bash: the skills mark, and the post-tool offer channel's context (3.4),
+    // then the learnings about the file the call touched, in the same one answer.
+    emitHook('PostToolUse', withTouchLearnings(await postBashPart(input, dir, false), input, dir));
+    return;
+  }
 
   if (event === 'cursor-post-tool') { handleCursorPostTool(input, dir); return; }
 
@@ -763,35 +618,10 @@ export async function main(event: string): Promise<void> {
   // session-start, whose Stop fires per turn and so has no real end signal.
   if (event === 'cursor-session-end') { summarizeSession(dir, cursorSessionId(input), { host: 'cursor' }); return; }
 
-  if (event === 'stop') { handleStop(input, dir); askForNote(input, dir); return; }
+  if (event === 'stop') { await handleStopEvent(input, dir); return; }
 
-  if (event === 'post-edit-sync') { await handlePostEdit(input, dir); handleStop(input, dir); return; }
+  // An edit's payload, not a Stop's: the turn-end bookkeeping only, so its one answer stays the edit's.
+  if (event === 'post-edit-sync') { await handlePostEdit(input, dir); await handleStopEvent(input, dir, { skills: false }); return; }
 
-  if (event === 'prompt') {
-    const prompt = String(input?.prompt ?? '').trim();
-    if (prompt.length < MIN_PROMPT_CHARS) return;
-    // Pointers-only, small, gated. No --source: per-prompt injected tokens are
-    // fresh full-price input on every turn (unlike the cached SessionStart
-    // orientation), so the pack carries locators, never inlined code — the agent
-    // pulls spans itself via `graft ask --source` when a pointer looks right.
-    // relevantRetrieval then drops the pack entirely when the prompt barely
-    // overlaps the top hit or when every hit was already injected this session.
-    const askArgs = withContextDirArg(dir, ['ask', prompt, '.', '--json', '-n', '3']);
-    // "You're working in backend/, weight it": only fires on a multi-scope
-    // repo whose lastFile resolves cleanly to one scope — see lastFileScopeHint.
-    const scopeHint = lastFileScopeHint(dir, readStats(dir)?.lastFile);
-    if (scopeHint) askArgs.push('--in', scopeHint);
-    const ask = graftJson(dir, askArgs, promptAskTimeout(dir));
-    if (!ask) return;
-    const id = input.session_id || 'default';
-    const s = readSession(dir, id);
-    s.lastQuery = prompt;
-    const agent = input?.agent?.name;
-    if (agent) s.perAgentQuery[agent] = prompt;
-    // Learnings first: what an earlier session worked out matters more than where code is.
-    const notes = brand() === 'trail' ? notesForPrompt(ask, s) : null;
-    const txt = [notes, relevantRetrieval(ask, s)].filter(Boolean).join('\n\n');
-    if (txt) emit('UserPromptSubmit', txt);
-    writeSession(dir, id, s);
-  }
+  if (event === 'prompt') { await handlePrompt(input, dir); return; }
 }

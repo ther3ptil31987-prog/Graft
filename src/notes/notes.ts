@@ -12,25 +12,38 @@
  * merge (branches.ts). A personal one, about one person's setup or habits,
  * stays on their machine in `~/.trail/repos/<repo>/notes/` (home.ts).
  *
- * One file per session and never edited after it's written. A summary only,
+ * One file per session, or per branch when a session goes on to another PR:
+ * a later save in the session adds to it (session-learning.ts), and nothing
+ * edits it after that. A summary only,
  * never a transcript: the agent writes the body, and nothing here reads
  * source files or prompts into it.
  */
 import { readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
-import { matter, type FrontMatterFile } from "../util/front-matter.js";
+import { join, relative, resolve, sep } from "node:path";
+import { matter, textList, warnSkipped, type FrontMatterFile } from "../util/front-matter.js";
 import { readBranchCache } from "./branches.js";
-import { changedFiles, ownPath } from "./git-facts.js";
-import { checkoutRoot, childCheckouts, ensureRepoHome, notePlaces, repoPlace, shownPath } from "./home.js";
+import { tokensLabel, tokensWorthSaying } from "./credit.js";
+import type { NoteHit } from "./find-notes.js";
+import { flatLine } from "./flatten.js";
+import { isAlwaysFollow } from "./units.js";
+import { ensureRepoHome, notePlaces, repoPlace, shownPath, type RepoPlace } from "./home.js";
+import { LEARNING_KEYS, learningFileName, liveLearnings, newLearningId, readLearningFields, type LearningFields } from "./learning-fields.js";
 import { ensureRepoTrail, LEARNINGS_DIR, learningsDir } from "./repo-trail.js";
+import { TOUCH_CHARS, TOUCH_LIMIT } from "./targets.js";
+import { isJustMe } from "./just-me.js";
+
+// Where a learning goes, which to show for a query and how one is credited live in their own files.
+export { findNotes, type NoteHit } from "./find-notes.js";
+export { mentionedFiles, noteTargets, type NoteTarget } from "./targets.js";
+export { commitLines, namesLabel, PR_SPEEDUP, setupCommitLine, TOKEN_CREDIT_FLOOR, tokensLabel, tokensWorthSaying } from "./credit.js";
 
 export interface NoteCost {
   minutes?: number;
   tokens?: number;
 }
 
-export interface Note {
+/** A learning. Its id, kind, scope, status and the rest are in `LearningFields`. */
+export interface Note extends LearningFields {
   /** Where the note is: an absolute path on this machine. */
   path: string;
   title: string;
@@ -44,16 +57,21 @@ export interface Note {
   body: string;
   /** Written by someone other than whoever is asking. */
   teammate?: boolean;
-  /** `repo`: in the repo's `.trail/learnings/`, for everyone. `personal`: in ~/.trail, this machine only. */
-  scope?: "repo" | "personal";
   /** A rule or preference for every session here, not knowledge about one
    * task: what the user kept having to tell Claude. The session-start hook
    * lists these up front, since no single task would bring them up. */
   standing?: boolean;
+  /** The file name of an earlier learning this one takes over from. The old
+   * file stays, as the record of what that session knew, but `listNotes`
+   * reads this one instead. */
+  replaces?: string;
   /** Found on a teammate's pushed branch (`origin/kumar/jitter`) rather than in
    * this checkout. `path` is then `<ref>:.trail/learnings/<name>`, readable
    * with `git show`, and the whole body travels with the note. */
   ref?: string;
+  /** The `touches` whose code is gone, so the learning may be stale. Set by
+   * `markStale` (stale.ts) on the learnings about to be shown. */
+  stale?: string[];
 }
 
 /** Which kind of learning to write: for the repo (the default) or for this person only. */
@@ -83,6 +101,8 @@ export function renderNote(n: Omit<Note, "path">): string {
   if (n.cost?.tokens !== undefined) cost.push(`tokens: ${n.cost.tokens}`);
   if (cost.length) fm.push(`cost: { ${cost.join(", ")} }`);
   if (n.standing) fm.push("standing: true");
+  // Evidence is free text, always quoted so YAML never reads "12" back as a number.
+  for (const k of LEARNING_KEYS) if (n[k]) fm.push(`${k}: ${k === "evidence" ? JSON.stringify(n[k]) : scalar(n[k]!)}`);
   if (n.touches.length) fm.push("touches:", ...n.touches.map((t) => `  - ${scalar(t)}`));
   fm.push("---", "");
   return `${fm.join("\n")}\n${n.body.trim()}\n`;
@@ -92,30 +112,46 @@ function num(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
-/** A note file, or null when it isn't one (no title in its frontmatter). */
+/** Front matter keys that hold one value: a list or a map under one refuses the file. */
+const NOTE_SCALARS = ["title", "author", "date", "branch"];
+
+/**
+ * A note file, or null when it isn't one (no title in its frontmatter), or
+ * when its front matter is refused (anchors, aliases, a list for a title) or
+ * isn't valid YAML, which says so once on stderr.
+ */
 export function parseNote(text: string, path: string): Note | null {
   let parsed: FrontMatterFile;
   try {
-    parsed = matter(text);
+    parsed = matter(text, { scalars: NOTE_SCALARS });
   } catch {
+    // The parser's own message quotes the file; the warning names it instead.
+    warnSkipped("the learning", path, "its front matter isn't valid YAML");
+    return null;
+  }
+  if (parsed.refused) {
+    warnSkipped("the learning", path, parsed.refused);
     return null;
   }
   const d = parsed.data as Record<string, unknown>;
-  if (typeof d.title !== "string" || !d.title.trim()) return null;
-  const date = d.date instanceof Date ? d.date.toISOString().slice(0, 10) : String(d.date ?? "");
+  // Title, author and date reach what agents read: one line each (flatten.ts).
+  const title = typeof d.title === "string" ? flatLine(d.title) : "";
+  if (!title) return null;
+  const date = d.date instanceof Date ? d.date.toISOString().slice(0, 10) : flatLine(d.date, 40);
   const cost = (d.cost ?? {}) as Record<string, unknown>;
   const minutes = num(cost.minutes);
   const tokens = num(cost.tokens);
   return {
     path,
-    title: d.title.trim(),
-    author: typeof d.author === "string" ? d.author : "",
+    title,
+    author: typeof d.author === "string" ? flatLine(d.author, 80) : "",
     date,
     branch: typeof d.branch === "string" ? d.branch : undefined,
     cost: minutes !== undefined || tokens !== undefined ? { minutes, tokens } : undefined,
-    touches: Array.isArray(d.touches) ? d.touches.map(String) : [],
+    touches: textList(d.touches, TOUCH_LIMIT, TOUCH_CHARS),
     body: parsed.content.trim(),
     ...(d.standing === true ? { standing: true } : {}),
+    ...readLearningFields(d, learningFileName(path)),
   };
 }
 
@@ -128,7 +164,7 @@ function rebaseTouch(t: string, checkout: string, here: string): string {
 }
 
 /** Every `.md` in `notesDir` that parses as a note, with touches rebased onto `here`. */
-function readNotesIn(notesDir: string, checkout: string, here: string, scope: LearningScope): Note[] {
+export function readNotesIn(notesDir: string, checkout: string, here: string, scope: LearningScope): Note[] {
   let files: string[];
   try {
     files = readdirSync(notesDir).filter((f) => f.endsWith(".md"));
@@ -149,7 +185,7 @@ function readNotesIn(notesDir: string, checkout: string, here: string, scope: Le
 
 /** The file name a note is known by, wherever it sits: one learning on a branch and in the tree is one learning. */
 export function noteName(n: Note): string {
-  return n.path.slice(Math.max(n.path.lastIndexOf("/"), n.path.lastIndexOf(":")) + 1);
+  return learningFileName(n.path);
 }
 
 /**
@@ -183,15 +219,20 @@ export function listNotes(dir: string, opts: { children?: boolean; branches?: bo
   return out.sort((a, b) => (a.date === b.date ? b.path.localeCompare(a.path) : b.date.localeCompare(a.date)));
 }
 
-/** The learnings on teammates' pushed branches, from the branch cache. */
+/** The learnings on teammates' pushed branches, from the branch cache. One that won't read is skipped, never the rest. */
 function branchNotes(checkout: string, here: string): Note[] {
   const cache = readBranchCache(checkout);
   if (!cache) return [];
   const out: Note[] = [];
   for (const b of cache.branches) {
     for (const l of b.learnings) {
-      const n = parseNote(l.text, `${b.ref}:${LEARNINGS_DIR}/${l.name}`);
-      if (n) out.push({ ...n, scope: "repo", ref: b.ref, touches: n.touches.map((t) => rebaseTouch(t, checkout, here)) });
+      const where = `${b.ref}:${LEARNINGS_DIR}/${l.name}`;
+      try {
+        const n = parseNote(l.text, where);
+        if (n) out.push({ ...n, scope: "repo", ref: b.ref, touches: n.touches.map((t) => rebaseTouch(t, checkout, here)) });
+      } catch (e) {
+        warnSkipped("the learning", where, e instanceof Error ? e.message : String(e));
+      }
     }
   }
   return out;
@@ -231,19 +272,36 @@ export interface WriteNoteInput {
   cost?: NoteCost;
   touches?: string[];
   standing?: boolean;
+  /** The fields a new learning may be given; its id, status and scope come from where it is written. */
+  kind?: LearningFields["kind"];
+  replaces?: string;
+  src?: LearningFields["src"];
+  evidence?: string;
+  /** Personal only: defaults to this repo. */
+  applies?: string;
 }
 
 /**
  * Write a new learning for the repo `dir` is in, and return it: into the
  * repo's `.trail/learnings/` (made if needed), or with `scope: "personal"`,
- * or outside git, into ~/.trail. Never overwrites: a second one with the same
- * name on the same day gets `-2`, `-3`.
+ * outside git or in a repo on trail just for this person (just-me.ts), into
+ * ~/.trail. Never overwrites: a second one with the same
+ * name on the same day gets `-2`, `-3`. Its id is 8 hex digits from the file
+ * name it gets (`newLearningId`), written into the file.
  */
 export function writeNote(dir: string, input: WriteNoteInput, scope: LearningScope = "repo"): Note {
-  const { place } = ensureRepoHome(dir);
+  let place: RepoPlace;
+  try {
+    place = ensureRepoHome(dir).place;
+  } catch (e) {
+    // Codex's sandbox can't write ~/.trail. A learning added to the repo doesn't need it, so it's still saved.
+    place = repoPlace(dir);
+    if (scope !== "repo" || !place.git) throw e;
+  }
   const inRepo = scope === "repo" && place.git;
   let notes: string;
-  if (inRepo) {
+  const shared = inRepo && !isJustMe(place.checkout);
+  if (shared) {
     ensureRepoTrail(place.checkout);
     notes = learningsDir(place.checkout);
   } else {
@@ -252,16 +310,17 @@ export function writeNote(dir: string, input: WriteNoteInput, scope: LearningSco
   const base = [input.date, slug(input.title) || "note", slug(input.author, 1)].filter(Boolean).join("-");
   let name = `${base}.md`;
   for (let i = 2; existsSync(join(notes, name)); i++) name = `${base}-${i}.md`;
+  // One line each, as every reader would show them (flatten.ts): what's written reads back the same.
   const note: Omit<Note, "path"> = {
-    title: input.title.trim(),
-    author: input.author,
+    title: flatLine(input.title),
+    author: flatLine(input.author, 80),
     date: input.date,
     branch: input.branch,
     cost: input.cost,
     touches: input.touches ?? [],
     body: input.body,
-    scope: inRepo ? "repo" : "personal",
     ...(input.standing ? { standing: true } : {}),
+    ...readLearningFields({ ...input, id: newLearningId(name), scope: shared ? "repo" : "personal", applies: shared ? undefined : (input.applies ?? place.key), status: "active" }, name),
   };
   writeFileSync(join(notes, name), renderNote(note));
   return { ...note, path: join(notes, name) };
@@ -270,10 +329,10 @@ export function writeNote(dir: string, input: WriteNoteInput, scope: LearningSco
 /**
  * The standing learnings for `dir`: the team's in the checkout and the
  * person's own, never ones on a teammate's unmerged branch, which nobody has
- * reviewed yet.
+ * reviewed yet, and only live ones (nothing retired or replaced).
  */
 export function standingLearnings(dir: string): Note[] {
-  return listNotes(dir, { branches: false }).filter((n) => n.standing && !n.ref);
+  return liveLearnings(listNotes(dir, { branches: false })).filter((n) => n.standing && !n.ref);
 }
 
 /** Where a learning is, as the agent and the person read it: `.trail/learnings/x.md`, `~/.trail/…`, or `origin/b:.trail/…`. */
@@ -285,157 +344,9 @@ export function notePlace(n: Note): string {
   return at === -1 ? shownPath(n.path) : path.slice(at + 1);
 }
 
-export interface NoteTarget {
-  /** A folder in the repo the note goes to. */
-  dir: string;
-  /** What the session touched there, relative to the top of that checkout. */
-  touches: string[];
-  /** What it only read there, same form; set when the session said what it read. */
-  read?: string[];
-}
-
-/** Most files one note lists per repo. */
-const TOUCH_LIMIT = 10;
-
-/**
- * Which repos a session's note belongs in, and what it touched in each.
- *
- * The repo the note was saved from gets the files it has uncommitted or
- * committed since `since`. Every other repo the session edited (`edited`:
- * absolute paths, from the agent's transcript) gets the note too, with its
- * own files, so a session that changed a backend and the library it calls
- * leaves a note in both. Saved from a folder that holds several repos, the
- * note goes to each repo the session changed, or stays with the folder when
- * it changed none. Two worktrees of one repo are one repo.
- *
- * `session.read`, when the transcript was found: the files the session opened.
- * Then the transcript says what was touched, and the working tree's other
- * uncommitted files, there before the session began, are left out.
- */
-export function noteTargets(dir: string, edited: string[] = [], since?: number, session?: { read: string[] }): NoteTarget[] {
-  const here = repoPlace(dir);
-  const byKey = new Map<string, { dir: string; files: string[]; read: string[] }>();
-  const entryFor = (checkout: string) => {
-    const key = repoPlace(checkout).key;
-    const entry = byKey.get(key) ?? { dir: checkout, files: [], read: [] };
-    byKey.set(key, entry);
-    return entry;
-  };
-  const add = (checkout: string, files: string[]) => {
-    const entry = entryFor(checkout);
-    for (const f of files) if (f && !ownPath(f) && !entry.files.includes(f)) entry.files.push(f);
-  };
-  const uncommitted = !session;
-  if (here.git) add(here.checkout, changedFiles(here.checkout, since, TOUCH_LIMIT, uncommitted));
-  else if (edited.length === 0) for (const c of childCheckouts(here.checkout)) add(c, changedFiles(c, since, TOUCH_LIMIT, uncommitted));
-  // The agent's own files (memory, plans, scratch under ~/.claude) aren't what a note is about.
-  const agentFiles = join(homedir(), ".claude") + sep;
-  const place = (f: string): [string, string] | null => {
-    if (f.startsWith(agentFiles)) return null;
-    const top = checkoutRoot(dirname(f));
-    if (top) return [top, relative(top, f).split(sep).join("/")];
-    if (!here.git && !relative(here.checkout, f).startsWith("..")) return [here.checkout, relative(here.checkout, f).split(sep).join("/")];
-    return null;
-  };
-  for (const f of edited) {
-    const at = place(f);
-    if (at) add(at[0], [at[1]]);
-  }
-  for (const f of session?.read ?? []) {
-    const at = place(f);
-    if (!at || ownPath(at[1])) continue;
-    const entry = byKey.get(repoPlace(at[0]).key);
-    // Reads only add to a repo the note already goes to: opening a file elsewhere doesn't make the note about that repo.
-    if (entry && !entry.files.includes(at[1]) && !entry.read.includes(at[1])) entry.read.push(at[1]);
-    else if (!entry && repoPlace(at[0]).key === here.key) entryFor(here.checkout).read.push(at[1]);
-  }
-  const out: NoteTarget[] = [...byKey.entries()]
-    .filter(([key, e]) => e.files.length > 0 || key === here.key)
-    .map(([, e]) => ({ dir: e.dir, touches: e.files.slice(0, TOUCH_LIMIT), ...(session ? { read: e.read.slice(0, TOUCH_LIMIT) } : {}) }));
-  // The repo it was saved from first; a folder of repos only when nothing else was touched.
-  out.sort((a, b) => Number(repoPlace(b.dir).key === here.key) - Number(repoPlace(a.dir).key === here.key));
-  const touched = out.filter((t) => t.touches.length > 0);
-  if (!here.git && touched.length > 0) return touched;
-  return out.length ? out : [{ dir: here.checkout, touches: [] }];
-}
-
-/** A path-shaped word in a note: `client.go`, `src/a/b.ts:12-30`, `x.go#Fn`. */
-const MENTION = /(?:^|[\s(`'"\[])((?:[\w.-]+\/)*[\w-][\w.-]*\.[A-Za-z][A-Za-z0-9]{0,5})(?=$|[\s:#)`'",.;\]])/gm;
-
-/**
- * Files of the checkout at `dir` that a note's text names by path. A session
- * that only read code edits nothing, so without these its note would touch no
- * file, and nothing that looks a note up by file (`trail check`, the ranked
- * search) would ever find it.
- */
-export function mentionedFiles(dir: string, body: string): string[] {
-  const out: string[] = [];
-  for (const m of body.matchAll(MENTION)) {
-    const f = m[1]!.replace(/^\.\//, "");
-    if (out.includes(f) || ownPath(f) || f.startsWith("..")) continue;
-    if (existsSync(join(dir, f))) out.push(f);
-    if (out.length >= TOUCH_LIMIT) break;
-  }
-  return out;
-}
-
-/* -------------------------------------------------------------------------- */
-/* finding the notes that matter for a query                                  */
-/* -------------------------------------------------------------------------- */
-
-const STOP = new Set(
-  "the and for with from that this what when where which into does how why are was were not but you your our out its it's can should would could about after before over under use using used fix find make".split(
-    " ",
-  ),
-);
-
-function terms(s: string): string[] {
-  return [...new Set(s.toLowerCase().split(/[^a-z0-9_]+/).filter((t) => t.length >= 3 && !STOP.has(t)))];
-}
-
-/** The file part of a `file#Symbol` touch. */
-function touchFile(t: string): string {
-  return t.split("#")[0]!;
-}
-
-export interface NoteHit {
-  note: Note;
-  score: number;
-  /** Files the note touches that this query's results also point into. */
-  shared: string[];
-}
-
-/**
- * The notes worth showing next to a query's results: ones whose title or body
- * share the query's words, or that touch a file the results point into. At
- * most `limit`, best first. A note has to clear a bar — two of the query's
- * words, or one in its title, or a shared file — so an unrelated note never
- * rides along just because it exists.
- */
-export function findNotes(notes: Note[], query: string, files: string[] = [], limit = 2): NoteHit[] {
-  const q = terms(query);
-  const hitFiles = new Set(files);
-  const out: NoteHit[] = [];
-  for (const note of notes) {
-    const title = new Set(terms(note.title));
-    const text = new Set(terms(`${note.body} ${note.touches.join(" ")}`));
-    let score = 0;
-    let matched = 0;
-    for (const t of q) {
-      if (title.has(t)) {
-        score += 3;
-        matched++;
-      } else if (text.has(t)) {
-        score += 1;
-        matched++;
-      }
-    }
-    const shared = [...new Set(note.touches.map(touchFile))].filter((f) => hitFiles.has(f));
-    score += shared.length * 4;
-    const clears = shared.length > 0 || matched >= 2 || [...title].some((t) => q.includes(t));
-    if (clears && score >= 3) out.push({ note, score, shared });
-  }
-  return out.sort((a, b) => b.score - a.score || b.note.date.localeCompare(a.note.date)).slice(0, limit);
+/** Where to read a learning: its place, or the `git show` that prints one on a teammate's unmerged branch. */
+export function whereToRead(n: Note): string {
+  return n.ref ? `git show ${shellQuote(flatLine(n.path, 300))}` : flatLine(notePlace(n), 300);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -449,12 +360,6 @@ export function shortDate(date: string): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
   if (!m) return date;
   return `${MONTHS[Number(m[2]) - 1] ?? m[2]} ${Number(m[3])}`;
-}
-
-/** `~9.6k tokens`, `~600 tokens`. */
-export function tokensLabel(n: number): string {
-  if (n >= 1000) return `~${(n / 1000).toFixed(n >= 10_000 ? 0 : 1).replace(/\.0$/, "")}k tokens`;
-  return `~${n} tokens`;
 }
 
 /** `took 12 min and ~9.6k tokens to work out`, or null when the note has no cost. */
@@ -471,10 +376,6 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function clip(s: string, n = 88): string {
-  return s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s;
-}
-
 /** What reading a note costs an agent, in tokens: its text at ~4 characters a token. */
 export function readingTokens(n: Note): number {
   return Math.ceil(renderNote(n).length / 4);
@@ -489,10 +390,11 @@ export function savedByNote(n: Note): number {
   return Math.max(0, took - readingTokens(n));
 }
 
-/** `Anirudh's learning`, `a learning`, `Kumar's learning on kumar/jitter`. */
+/** `Maya's learning`, `a learning`, `Kumar's learning on kumar/jitter`. */
 export function whoseLearning(n: Note): string {
-  const who = n.author ? `${n.author}'s learning` : "a learning";
-  return n.ref ? `${who} on ${n.ref.replace(/^origin\//, "")}` : who;
+  const author = flatLine(n.author, 80);
+  const who = author ? `${author}'s learning` : "a learning";
+  return n.ref ? `${who} on ${flatLine(n.ref.replace(/^origin\//, ""), 80)}` : who;
 }
 
 /**
@@ -501,133 +403,81 @@ export function whoseLearning(n: Note): string {
  * where to read the rest. A learning on a teammate's unmerged branch says so,
  * with the `git show` that prints it, since there's no file here to open. An agent
  * relays the cost when it says what the turn saved, which is how the saving
- * becomes countable.
+ * becomes countable. Every field is flattened to one line: a learning's text
+ * comes from whoever wrote it, and a line of its own could pass for trail's.
  */
 export function formatNoteHits(hits: NoteHit[]): string[] {
   const lines: string[] = [];
   for (const { note } of hits) {
-    const who = `${note.author ? `${note.author}'s learning` : "a learning"}${note.teammate ? ", a teammate's" : ""}`;
-    lines.push(`from ${who} · ${shortDate(note.date)} · ${note.title}`);
+    const author = flatLine(note.author, 80);
+    const who = `${author ? `${author}'s learning` : "a learning"}${note.teammate ? ", a teammate's" : ""}`;
+    lines.push(`from ${who}${isAlwaysFollow(note) ? " · always follow" : ""} · ${flatLine(shortDate(note.date), 40)} · ${flatLine(note.title)}`);
+    if (note.stale?.length) lines.push(`  may be stale  ${staleLine(note)}`);
     const cost = costLabel(note.cost);
     for (const s of SECTIONS) {
       const lead = sectionLead(note.body, s.heading);
-      if (lead) lines.push(`  ${s.label.padEnd(11)} ${clip(lead)}`);
+      if (lead) lines.push(`  ${s.label.padEnd(11)} ${flatLine(lead, 88)}`);
     }
     if (note.ref) {
       // On a teammate's branch, not reviewed yet: where to read the rest, and that it's unmerged.
-      lines.push(`  on ${note.ref.replace(/^origin\//, "")}, pushed and not merged yet · git show ${shellQuote(note.path)}${cost ? ` · ${cost}` : ""}`);
+      const ref = flatLine(note.ref.replace(/^origin\//, ""), 80);
+      lines.push(`  on ${ref}, pushed and not merged yet · git show ${shellQuote(flatLine(note.path, 300))}${cost ? ` · ${cost}` : ""}`);
       lines.push("");
       continue;
     }
-    lines.push(`  ${notePlace(note)}${cost ? ` · ${cost}` : ""}`);
+    lines.push(`  ${flatLine(notePlace(note), 300)}${cost ? ` · ${cost}` : ""}`);
     lines.push("");
   }
   return lines;
 }
 
+/**
+ * What to say about a learning `markStale` (stale.ts) flagged: which code it
+ * names is gone, and to check it before following it. The names come from the
+ * learning's own file, so each is flattened and at most two are named.
+ */
+export function staleLine(note: Note): string {
+  // A gone file's own gone symbol names it already: `a.ts#f`, not `a.ts, a.ts#f`.
+  const gone = (note.stale ?? []).filter((t, _, all) => !all.some((o) => o.startsWith(`${t}#`)));
+  const named = gone.slice(0, 2).map((t) => flatLine(t, 120)).join(", ") + (gone.length > 2 ? ` and ${gone.length - 2} more` : "");
+  return `${named} ${gone.length === 1 ? "is" : "are"} gone from the code. Check it against the code before you follow it; if it no longer holds, save what's true now with trail note --replaces ${note.id}`;
+}
+
 /** The line an agent closes its reply with after saving a learning just for the user. */
 export const PERSONAL_SAVED_LINE = "📝 Saved just for you · stays on this machine, out of the repo";
 
-/** `Anay`, `Anay and Rushil`, `Anay, Rushil and 3 others`. */
-export function namesLabel(names: string[]): string {
-  if (names.length <= 2) return names.join(" and ");
-  if (names.length === 3) return `${names[0]}, ${names[1]} and ${names[2]}`;
-  return `${names[0]}, ${names[1]} and ${names.length - 2} others`;
-}
-
-/** `48k`, `3.8k`, `600`. */
-function tokensShort(n: number): string {
-  return tokensLabel(n).replace(/^~/, "").replace(" tokens", "");
-}
-
-/** What starting from a teammate's learning is worth when its tokens are too few to say: time to a PR. */
-export const PR_SPEEDUP = "3x faster";
-
-/**
- * Below this many tokens, what a learning saves is too small a number to
- * impress, so trail credits it as a faster PR instead.
- */
-export const TOKEN_CREDIT_FLOOR = 80_000;
-
-/** Whether a token count is big enough to be the credit. */
-export function tokensWorthSaying(tokens: number | undefined): boolean {
-  return (tokens ?? 0) >= TOKEN_CREDIT_FLOOR;
-}
-
-/**
- * The lines that close a reply after a team learning is saved, one for each
- * way the turn can end, since only the agent knows whether it committed the
- * learning by then. Uncommitted, it makes the case for committing: who else
- * works on the same files, and the head start their agents would get, which
- * is what the learning took to work out, or a faster PR when that's small.
- */
-export function commitLines(
-  note: Pick<Note, "cost">,
-  teammates: string[],
-  where: "files" | "repo" = "files",
-): { committed: string; uncommitted: string } {
-  const tokens = note.cost?.tokens;
-  const short = tokensWorthSaying(tokens) ? tokensShort(tokens!) : null;
-  // "an 80k-token", "an 11k-token": said aloud, they start with a vowel.
-  const start = short ? `${/^8|^1[18]k$/.test(short) ? "an" : "a"} ${short}-token head start` : null;
-  const place = where === "files" ? "this part of the codebase" : "this repo";
-  if (!teammates.length) {
-    return start
-      ? {
-          committed: `📝 Committed · your teammates' agents now get ${start}`,
-          uncommitted: `🌱 Commit what you learned and give your teammates' agents ${start}`,
-        }
-      : {
-          committed: `📝 Committed · your teammates' agents now get to a PR ${PR_SPEEDUP}`,
-          uncommitted: `🌱 Commit what you learned and your teammates' agents get to a PR ${PR_SPEEDUP}`,
-        };
-  }
-  const who = namesLabel(teammates);
-  const work = teammates.length === 1 ? "works" : "work";
-  return start
-    ? {
-        committed: `📝 Committed · ${who} ${work} in ${place}, and their agents now get ${start}`,
-        uncommitted: `🌱 ${who} ${work} in ${place}. Commit what you learned and give their agents ${start}`,
-      }
-    : {
-        committed: `📝 Committed · ${who} ${work} in ${place}, and their agents now get to a PR ${PR_SPEEDUP}`,
-        uncommitted: `🌱 ${who} ${work} in ${place}. Commit what you learned and their agents get to a PR ${PR_SPEEDUP}`,
-      };
-}
-
-/**
- * The line asking for trail's shared setup to be committed, once: `.trail/`
- * and the SessionStart entry in `.claude/settings.json` are what let a
- * teammate's Claude read the learnings before they install anything.
- */
-export function setupCommitLine(teammates: string[]): string {
-  const ask = "Commit .trail/ and .claude/settings.json once";
-  if (!teammates.length) return `🌱 ${ask}, and your teammates' Claude starts from your learnings, even before they install trail`;
-  const work = teammates.length === 1 ? "works" : "work";
-  return `🌱 ${namesLabel(teammates)} ${work} in this repo. ${ask}, and their Claude starts from your learnings, even before they install trail`;
-}
-
 /**
  * What starting from these learnings is worth, for the agent's closing line:
- * the tokens they saved, less what reading them costs, when that's worth
- * saying, otherwise a faster PR.
+ * the tokens they saved, less what reading them costs, when their own
+ * measured cost makes that worth saying. Null otherwise: a learning with no
+ * measured cost (one kept from `trail init` seconds ago) has earned no claim.
  */
-export function learningCredit(hits: NoteHit[]): string {
+export function learningCredit(hits: NoteHit[]): string | null {
   const saved = hits.reduce((sum, h) => sum + savedByNote(h.note), 0);
-  if (!tokensWorthSaying(saved)) return `${PR_SPEEDUP} to a PR`;
+  if (!tokensWorthSaying(saved)) return null;
   const minutes = hits.reduce((sum, h) => sum + (h.note.cost?.minutes ?? 0), 0);
   return `saved ${tokensLabel(saved)}${minutes > 0 ? ` and ~${minutes} min` : ""}`;
 }
 
 /**
+ * The tokens `learningSavingsLine` claims for `hits`, or 0 when it would claim
+ * none. What a hook adds to the session's counter when it shows them, in full
+ * or on one line, counted from the learnings, never parsed back out of text.
+ */
+export function learningSavedTokens(hits: NoteHit[]): number {
+  const saved = hits.reduce((sum, h) => sum + savedByNote(h.note), 0);
+  return tokensWorthSaying(saved) ? saved : 0;
+}
+
+/**
  * The line that credits reused learnings, for `ask` and the agent's closing
  * line: what they took to work out, less what reading them here costs, when
- * that's worth saying, otherwise a faster PR. Null when none were shown.
+ * their own measured cost makes that worth saying. Null when none were shown
+ * or none has earned a claim.
  */
 export function learningSavingsLine(hits: NoteHit[]): string | null {
-  if (!hits.length) return null;
-  const saved = hits.reduce((sum, h) => sum + savedByNote(h.note), 0);
-  if (!tokensWorthSaying(saved)) return `[trail] starting from ${hits.length === 1 ? "this learning" : "these learnings"} gets you to a PR ${PR_SPEEDUP}.`;
+  const saved = learningSavedTokens(hits);
+  if (!saved) return null;
   const read = hits.reduce((sum, h) => sum + readingTokens(h.note), 0);
   const minutes = hits.reduce((sum, h) => sum + (h.note.cost?.minutes ?? 0), 0);
   const time = minutes > 0 ? ` and ~${minutes} min` : "";

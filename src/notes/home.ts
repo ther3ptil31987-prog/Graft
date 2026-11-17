@@ -36,12 +36,12 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { readJson, writeJsonAtomic } from "../util/state.js";
 import { readBranchCache } from "./branches.js";
-import { hasRepoTrail, learningFiles } from "./repo-trail.js";
+import { hasRepoTrail, learningFiles, learningsDir } from "./repo-trail.js";
+import { liveLearnings, readLearningFields, type LearningFields } from "./learning-fields.js";
+import { matter } from "../util/front-matter.js";
+import { trailHome } from "./trail-home.js";
 
-/** `~/.trail`, or `$TRAIL_HOME`. */
-export function trailHome(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
-  return env.TRAIL_HOME ? resolve(env.TRAIL_HOME) : join(home, ".trail");
-}
+export { trailHome };
 
 /** A path as people read it: `~/.trail/…` under the home folder, absolute otherwise. */
 export function shownPath(p: string): string {
@@ -133,7 +133,13 @@ export function remoteUrl(config: string): string | null {
 
 /** One path segment of a key: lowercase, safe as a folder name, never `.` or `..`. */
 function segment(s: string): string {
-  const out = s.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const dashed = s.toLowerCase().replace(/[^a-z0-9._-]+/g, "-");
+  // Trim the dashes by hand: `/-+$/` rescans every run of dashes, quadratic on a long one.
+  let a = 0;
+  let b = dashed.length;
+  while (a < b && dashed[a] === "-") a++;
+  while (b > a && dashed[b - 1] === "-") b--;
+  const out = dashed.slice(a, b);
   return /^\.+$/.test(out) ? "" : out;
 }
 
@@ -169,6 +175,25 @@ export function keyFromRemote(url: string): string | null {
     .filter(Boolean);
   if (!host || parts.length === 0) return null;
   return [host, ...parts].join("/");
+}
+
+/**
+ * The checkout at or above `start` and its remote's key (`github.com/nanonets/assign`),
+ * as written in its git config, before any `insteadOf`: a clone whose fetches go
+ * somewhere else still names the same repo. Null outside git or without a remote.
+ * Reads only; spawns nothing.
+ */
+export function remoteKey(start: string): { checkout: string; key: string } | null {
+  const top = checkoutRoot(start);
+  const dirs = top ? gitDirs(top) : null;
+  if (!top || !dirs) return null;
+  try {
+    const url = remoteUrl(readFileSync(join(dirs.commonDir, "config"), "utf8"));
+    const key = url ? keyFromRemote(url) : null;
+    return key ? { checkout: top, key } : null;
+  } catch {
+    return null;
+  }
 }
 
 /** `local/Users-priya-src-extract`: the key for a repo with no remote, or a folder outside git. */
@@ -238,6 +263,7 @@ function rootCommits(checkout: string): string[] {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 5000,
+      windowsHide: true,
     });
     return out.split("\n").map((l) => l.trim()).filter(Boolean).sort();
   } catch {
@@ -289,7 +315,7 @@ the rest, and none of it leaves this machine unless you share it.
 - cloud.json             your Trail workspace, once you've connected one
 
 <repo> is the repo's remote (github.com/owner/name), so every clone and
-worktree of one repo shares its notes. Repos without a remote are under
+worktree of one repo shares its learnings. Repos without a remote are under
 local/, by path.
 `;
 
@@ -375,23 +401,66 @@ export function keepsNotes(dir: string, env: NodeJS.ProcessEnv = process.env): b
   return notePlaces(dir, env).some((p) => existsSync(p.dir) || (p.git && hasRepoTrail(p.checkout)));
 }
 
+/** What `liveLearnings` needs of one learning file, read quietly, or null when it isn't a learning (no title, unreadable). */
+type Counted = Pick<LearningFields, "id" | "status" | "replaces" | "scope"> & { date: string; path: string; ref?: string };
+
+function counted(text: string, name: string, scope: "repo" | "personal", ref?: string): Counted | null {
+  try {
+    const parsed = matter(text);
+    const d = parsed.data as Record<string, unknown>;
+    if (parsed.refused || typeof d.title !== "string" || !d.title.trim()) return null;
+    const date = d.date instanceof Date ? d.date.toISOString().slice(0, 10) : String(d.date ?? "");
+    return { ...readLearningFields(d, name), scope, date, path: name, ...(ref ? { ref } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+function readText(path: string): string | null {
+  try {
+    return readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+}
+
 /**
- * How many learnings bear on `dir`, counted without reading them: the repo's
- * `.trail/learnings/`, this machine's own, and the ones on teammates' pushed
- * branches, one per file name. Spawns nothing: the statusline calls it.
+ * How many live learnings bear on `dir`: the repo's `.trail/learnings/`, this
+ * machine's own, and the ones on teammates' pushed branches, one per file
+ * name, leaving out what is retired, held or replaced (`liveLearnings`).
+ * Spawns nothing and prints nothing: the statusline calls it.
  */
 export function noteCount(dir: string, env: NodeJS.ProcessEnv = process.env): number {
-  const names = new Set<string>();
+  const c = noteCounts(dir, env);
+  return c.repo + c.personal;
+}
+
+/** The live learnings bearing on `dir` by where they live: the repo's (`.trail/learnings/`, teammates' branches) and the person's own in the Trail home. */
+export interface NoteCounts { repo: number; personal: number }
+
+/** `noteCount`, split by place, so the session start names each where it is. */
+export function noteCounts(dir: string, env: NodeJS.ProcessEnv = process.env): NoteCounts {
+  const all: Counted[] = [];
+  const seen = new Set<string>();
+  const add = (name: string, text: string | null, scope: "repo" | "personal", ref?: string) => {
+    if (seen.has(name) || text === null) return;
+    const c = counted(text, name, scope, ref);
+    if (!c) return;
+    seen.add(name);
+    all.push(c);
+  };
   for (const p of notePlaces(dir, env)) {
-    if (p.git) for (const f of learningFiles(p.checkout)) names.add(f);
+    if (p.git) for (const f of learningFiles(p.checkout)) add(f, readText(join(learningsDir(p.checkout), f)), "repo");
     try {
-      for (const f of readdirSync(join(p.dir, "notes"))) if (f.endsWith(".md")) names.add(f);
+      for (const f of readdirSync(join(p.dir, "notes"))) if (f.endsWith(".md")) add(f, readText(join(p.dir, "notes", f)), "personal");
     } catch {
       /* none */
     }
-    if (p.git) for (const b of readBranchCache(p.checkout)?.branches ?? []) for (const l of b.learnings) names.add(l.name);
+    if (p.git) for (const b of readBranchCache(p.checkout)?.branches ?? []) for (const l of b.learnings) add(l.name, l.text, "repo", b.ref);
   }
-  return names.size;
+  const live = liveLearnings(all);
+  const personal = live.filter((c) => c.scope === "personal").length;
+  return { repo: live.length - personal, personal };
 }
 
 /* -------------------------------------------------------------------------- */

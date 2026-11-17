@@ -104,6 +104,24 @@ test('runInit is idempotent', () => {
   assert.deepEqual(s.permissions.allow, ['Bash(trail:*)', 'Bash(graft:*)', 'Bash(npx graft:*)', 'Bash(graft-dev:*)', 'Bash(node dist/cli.js:*)']);
 });
 
+test('runInit removes legacy footers and preserves foreign entries across refreshes', () => {
+  const d = fresh();
+  const home = fresh();
+  const settings = join(d, '.claude', 'settings.json');
+  runInit(d, { build: false, home });
+  const stale = JSON.parse(readFileSync(settings, 'utf8'));
+  stale.footerLinksRegexes = ['graft/[\\w./-]+\\.md', 'docs/.*'];
+  writeFileSync(settings, JSON.stringify(stale));
+
+  runInit(d, { build: false, home });
+  const refreshed = readFileSync(settings, 'utf8');
+  const s = JSON.parse(refreshed);
+  assert.deepEqual(s.footerLinksRegexes, ['docs/.*']);
+  assert.equal(JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8')).footerLinksRegexes, undefined);
+  runInit(d, { build: false, home });
+  assert.equal(readFileSync(settings, 'utf8'), refreshed, 'a second refresh changes no settings');
+});
+
 test('runInit appends the allowlist to a pre-existing permissions block, preserving unrelated entries', () => {
   const d = fresh();
   mkdirSync(join(d, '.claude'), { recursive: true });
@@ -145,6 +163,21 @@ test('formatInitEpilogue: graph built shows stats, wordmark, and the 3-step list
   assert.ok(out.includes('git add .claude'));
 });
 
+test('formatInitEpilogue: under trail the wordmark says trail, not graft', () => {
+  const before = process.env.TRAIL_INVOKED_AS;
+  process.env.TRAIL_INVOKED_AS = 'trail';
+  try {
+    const out = formatInitEpilogue({ graphBuilt: true, nodes: 6398, edges: 10912 });
+    assert.ok(!out.includes("/ _` | '__/ _` | |_| __|"), 'no graft wordmark');
+    assert.ok(out.includes(" | __| '__/ _` | | |"), 'the trail wordmark');
+    assert.ok(out.includes('6,398 nodes · 10,912 edges'));
+    assert.ok(out.includes('trail ask') && !out.includes('graft ask'));
+  } finally {
+    if (before === undefined) delete process.env.TRAIL_INVOKED_AS;
+    else process.env.TRAIL_INVOKED_AS = before;
+  }
+});
+
 test('formatInitEpilogue: graph not built shows "build the graph" as step 1, no stats, same column alignment', () => {
   const built = formatInitEpilogue({ graphBuilt: true, nodes: 4, edges: 4 });
   const notBuilt = formatInitEpilogue({ graphBuilt: false });
@@ -168,10 +201,10 @@ test('CLI: graft init prints one line per step, and no banner', () => {
     { encoding: 'utf8' },
   );
   assert.equal(res.status, 0, res.stderr);
-  assert.match(res.stderr, /skipped the graph build — run graft build/);
+  assert.match(res.stderr, /skipped the graph build: run graft build/);
   assert.match(res.stderr, /✓ claude +\.claude[\\/], \.mcp\.json/);
   assert.match(res.stderr, /restart your agents so a new session picks up graft/);
-  assert.match(res.stderr, /commit \.claude\/ \.mcp\.json to share it — graft\/ stays local and git-ignored/);
+  assert.match(res.stderr, /commit \.claude\/ \.mcp\.json to share it: graft\/ stays local and git-ignored/);
   assert.ok(!res.stderr.includes('|___/'), 'the banner is --verbose only');
   assert.ok(!res.stderr.includes('✓ wrote'), 'file-by-file lines are --verbose only');
 });

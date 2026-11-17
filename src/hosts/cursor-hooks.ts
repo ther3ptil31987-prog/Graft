@@ -21,6 +21,7 @@
  *     double-counted against `afterMCPExecution`.
  *   - `afterMCPExecution` → the graft MCP calls, savings parsed from `result_json`.
  *   - `sessionEnd` → roll the closed session up into `session_summary` as Cursor.
+ *   - `sessionStart` → show the no-install learning offer once at session start.
  */
 import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -29,6 +30,7 @@ import type { PlannedWrite } from './plan.js';
 import { writeOwned, isGraftEntry, readJsonObject, type ConfigWrite } from './config-write.js';
 import { cursorHookShimRelPath } from './registry.js';
 import type { Brand } from '../brand.js';
+import { failOpen } from '../claude/settings-merge.js';
 
 /** The Cursor hooks.json schema version graft writes. */
 const CURSOR_HOOKS_VERSION = 1;
@@ -57,15 +59,14 @@ export function cursorHookTargets(repo: string, name: Brand = 'graft'): PlannedW
     {
       hostId: 'cursor', id: 'cursor-hooks',
       path: configPathFor(repo),
-      scope: 'repo', kind: 'hook', what: 'postToolUse / afterMCPExecution / sessionEnd',
+      scope: 'repo', kind: 'hook', what: 'Cursor session and tool hooks',
     },
   ];
 }
 
 /**
  * The graft hook entries Cursor should carry. `matcher` is set only where Cursor
- * filters by tool (postToolUse); `afterMCPExecution` fires for every MCP tool and
- * `sessionEnd` for none, so they carry no matcher.
+ * filters by tool (postToolUse); the lifecycle and MCP hooks carry no matcher.
  */
 interface DesiredEntry { event: string; matcher?: string; sub: string; }
 function desiredEntries(): DesiredEntry[] {
@@ -73,6 +74,7 @@ function desiredEntries(): DesiredEntry[] {
     { event: 'postToolUse', matcher: 'Read|Grep|Glob|Search|Shell', sub: 'cursor-post-tool' },
     { event: 'afterMCPExecution', sub: 'cursor-mcp' },
     { event: 'sessionEnd', sub: 'cursor-session-end' },
+    { event: 'sessionStart', sub: 'cursor-session-start' },
   ];
 }
 
@@ -103,7 +105,8 @@ export function installCursorHooks(repo: string, name: Brand = 'graft'): ConfigW
   for (const d of desiredEntries()) {
     if (hooks[d.event] !== undefined && !Array.isArray(hooks[d.event])) return [shimWrite, skipped];
     const prior: unknown[] = Array.isArray(hooks[d.event]) ? hooks[d.event] : [];
-    const command = `node "${shimPath}" ${d.sub}`;
+    // D116 item 6: fails open, like every Trail hook command, so a missing shim never shows a hook error.
+    const command = failOpen(`node "${shimPath}" ${d.sub}`);
     const entry = d.matcher ? { matcher: d.matcher, command } : { command };
     hooks[d.event] = [...prior.filter((e) => !isGraftEntry(e)), entry];
   }

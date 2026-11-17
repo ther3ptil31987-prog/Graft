@@ -27,7 +27,12 @@ import {
   type PickerKey,
   keptLearnings,
   learningsPickerState,
+  learningsTitle,
+  displayWidth,
+  drivePicker,
+  renderedRows,
 } from '../src/cli-picker.js';
+import { EventEmitter } from 'node:events';
 
 function fresh(): string { return mkdtempSync(join(tmpdir(), 'graft-picker-')); }
 
@@ -195,18 +200,18 @@ test('renderPicker marks the cursor and folds undetected hosts into one line', (
   const repo = fresh(); const home = fresh(); // nothing installed
   const state = initialPickerState(planInit(repo, { home }), repo, home);
   const text = renderPicker(state, false);
-  assert.match(text, /^graft init — pick the agents your team uses:/);
-  assert.match(text, /› \[x\] claude/);
+  assert.match(text, /^graft init · pick the agents your team uses:/);
+  assert.match(text, /› \[✓\] claude/);
   assert.doesNotMatch(text, /\[ \] cursor/, 'an agent graft cannot find is folded away');
   assert.match(text, /\+ \d+ not detected \(.*cursor.*\) · m to show/);
   assert.match(text, /space toggle · a all · m more · enter confirm/);
   // Only the detected rows get a checkbox until `m`.
-  assert.equal(text.split('\n').filter((l) => /\[[ x]\]/.test(l)).length, visibleRows(state).length);
+  assert.equal(text.split('\n').filter((l) => /\[[ ✓]\]/.test(l)).length, visibleRows(state).length);
 
   const opened = reducePicker(state, 'more');
   const all = renderPicker(opened, false);
   assert.match(all, /\[ \] cursor \(not detected\)/);
-  assert.equal(all.split('\n').filter((l) => /\[[ x]\]/.test(l)).length, state.rows.length);
+  assert.equal(all.split('\n').filter((l) => /\[[ ✓]\]/.test(l)).length, state.rows.length);
 });
 
 test('a never selects an agent that is folded away', () => {
@@ -229,11 +234,11 @@ test('formatPlan separates repo writes from machine-wide ones', () => {
   const repo = fresh(); const home = fullHome();
   const plan = planInit(repo, { home });
   const text = formatPlan(plan, ['claude', 'agents'], repo, home, false);
-  const repoAt = text.indexOf('would write — this repo:');
+  const repoAt = text.indexOf('would write in this repo:');
   const globalAt = text.indexOf('affects ALL repos:');
   assert.ok(repoAt >= 0 && globalAt > repoAt, 'repo section comes first');
   assert.ok(text.includes(`~${sep}${join('.codex', 'hooks.json')}`), `plan should name the codex hooks file:\n${text}`);
-  assert.match(text, /SessionStart \/ UserPromptSubmit \/ PostToolUse \/ Stop/);
+  assert.match(text, /SessionStart \/ UserPromptSubmit \/ PreToolUse \/ PostToolUse \/ Stop/);
   assert.match(text, /nothing was written \(--dry-run\)/);
   assert.match(text, /--no-global/);
 });
@@ -336,35 +341,119 @@ test('a (toggle all) is about agents and leaves the consent answer alone', () =>
 test('the rendered row shows the label, a rule, and what is not collected', () => {
   const repo = fresh(); const home = fullHome();
   const out = renderPicker(initialPickerState(planInit(repo, { home }), repo, home, { offerTelemetry: true }), false);
-  assert.match(out, /\[x\] anonymous usage stats/);
+  assert.match(out, /\[✓\] anonymous usage stats/);
   assert.match(out, /no code, no file paths, no queries/);
   assert.equal(out.includes(TELEMETRY_ROW_ID), false, 'the internal id must never be shown');
   assert.match(out, /─/, 'a rule separates the settings from the agents');
 });
 
-test('the learnings picker starts with every learning ticked, and enter keeps the ticked ones in order', () => {
+test("the learnings picker ticks the team's learnings, leaves the person's own unticked, and enter keeps the ticked ones in order", () => {
   let state = learningsPickerState([
-    { title: 'Use pnpm, not npm', forTeam: true, sessions: 6 },
+    { title: 'Return a 500 when db.query fails', forTeam: true, prs: [41, 38] },
     { title: 'Say what you understood first', forTeam: false, sessions: 4 },
-    { title: 'Run go test with -race', forTeam: true, sessions: 2 },
+    { title: 'Run go test with -race', forTeam: true, memory: true },
   ]);
-  assert.deepEqual(keptLearnings(state), [0, 1, 2]);
-  const shown = renderPicker(state, false, { title: 'keep:' });
-  assert.match(shown, /\[x\] Use pnpm, not npm\s+for your team · told Claude in 6 sessions/);
-  assert.match(shown, /\[x\] Say what you understood first\s+just for you · told Claude in 4 sessions/);
-  state = reducePicker(reducePicker(state, 'down'), 'space');
   assert.deepEqual(keptLearnings(state), [0, 2]);
-  state = reducePicker(state, 'all');
-  assert.deepEqual(keptLearnings(state), [0, 1, 2], 'a ticks every one back');
+  const shown = renderPicker(state, false, { title: 'keep:' });
+  assert.match(shown, /\[✓\] Return a 500 when db\.query fails\s+for your team · from review on PR #41, #38/);
+  assert.match(shown, /\[ \] Say what you understood first\s+just for you · told Claude in 4 sessions/);
+  assert.match(shown, /\[✓\] Run go test with -race\s+for your team · from your Claude's memory of this repo/);
+  state = reducePicker(reducePicker(state, 'down'), 'space');
+  assert.deepEqual(keptLearnings(state), [0, 1, 2]);
+  state = reducePicker(state, 'space');
+  assert.deepEqual(keptLearnings(state), [0, 2]);
 });
 
-test('a learning from PR reviews says how many PRs flagged it, in the same list as the session ones', () => {
-  const state = learningsPickerState([
-    { title: 'Use pnpm, not npm', forTeam: true, sessions: 6 },
-    { title: 'Return a 500 when db.query fails', forTeam: true, prs: 3 },
-  ]);
-  assert.deepEqual(keptLearnings(state), [0, 1]);
-  const shown = renderPicker(state, false, { title: 'keep:' });
-  assert.match(shown, /\[x\] Use pnpm, not npm\s+for your team · told Claude in 6 sessions/);
-  assert.match(shown, /\[x\] Return a 500 when db\.query fails\s+for your team · flagged in review on 3 PRs/);
+test("the picker's title says the team's learnings are new to teammates, or that the list is the person's own", () => {
+  assert.match(learningsTitle([{ title: 'a', forTeam: true, prs: [1, 2] }, { title: 'b', forTeam: false, sessions: 2 }]), /your teammates' Claude doesn't know these yet/);
+  assert.match(learningsTitle([{ title: 'b', forTeam: false, sessions: 2 }]), /you told Claude these more than once/);
+  const many = renderPicker(learningsPickerState([{ title: 'a', forTeam: true, prs: [9, 8, 7, 6, 5] }]), false, { title: null });
+  assert.match(many, /from review on PR #9, #8, #7 \+2/);
+});
+
+/**
+ * Just enough of a terminal to watch a redraw: `columns` wide, lines wrap
+ * (with xterm's deferred wrap at the last column), `\n` starts a new row,
+ * `ESC[nA` moves up, `ESC[0J` clears to the end of the screen, colours are
+ * ignored. `screen()` is what a person would see.
+ */
+function terminal(columns: number) {
+  const rows: string[][] = [[]];
+  let row = 0;
+  let col = 0;
+  const at = (r: number) => (rows[r] ??= []);
+  return {
+    columns,
+    write(s: string) {
+      for (let i = 0; i < s.length; ) {
+        const csi = /^\x1b\[([0-9;?]*)([A-Za-z])/.exec(s.slice(i));
+        if (csi) {
+          const n = Number(csi[1] || '1');
+          if (csi[2] === 'A') { row = Math.max(0, row - n); col = Math.min(col, columns - 1); }
+          if (csi[2] === 'J') { at(row).length = Math.min(at(row).length, col); rows.length = row + 1; }
+          i += csi[0].length;
+          continue;
+        }
+        const ch = String.fromCodePoint(s.codePointAt(i)!);
+        i += ch.length;
+        if (ch === '\n') { row++; col = 0; at(row); continue; }
+        const w = displayWidth(ch);
+        if (col + w > columns) { row++; col = 0; }
+        at(row)[col] = ch;
+        if (w === 2) at(row)[col + 1] = '';
+        col += w;
+      }
+      return true;
+    },
+    screen(): string[] {
+      return rows.map((r) => Array.from(r, (c) => c ?? ' ').join('').trimEnd());
+    },
+  };
+}
+
+function fakeStdin() {
+  return Object.assign(new EventEmitter(), {
+    isRaw: false,
+    setRawMode(raw: boolean) { this.isRaw = raw; },
+    resume() {},
+    pause() {},
+  });
+}
+
+test('renderedRows counts the rows a wrapped line takes, not just the lines', () => {
+  assert.equal(renderedRows('a\nb', 80), 2);
+  assert.equal(renderedRows('x'.repeat(80), 80), 1, 'exactly the width is one row');
+  assert.equal(renderedRows('x'.repeat(81), 80), 2);
+  assert.equal(renderedRows(`\x1b[2m${'x'.repeat(80)}\x1b[0m`, 80), 1, 'colour codes take no room');
+  assert.equal(renderedRows('', 80), 1);
+  assert.equal(renderedRows('漢'.repeat(41), 80), 2, 'wide characters take two columns');
+});
+
+test('in an 80-column terminal, redrawing the picker over a wrapped line leaves no copy of its title behind', async () => {
+  const repo = fresh(); const home = fresh(); // nothing installed: the "+ N not detected (…)" line is long
+  const state = initialPickerState(planInit(repo, { home }), repo, home);
+  const text = renderPicker(state, true);
+  assert.ok(text.split('\n').some((l) => displayWidth(l) > 80), 'a line wider than 80 columns, so it wraps');
+
+  const term = terminal(80);
+  term.write('$ graft init\n');
+  const stdin = fakeStdin();
+  const picked = drivePicker(state, undefined, { out: term, stdin });
+  const titles = () => term.screen().filter((l) => l.includes('pick the agents your team uses')).length;
+  assert.equal(titles(), 1);
+  for (const key of ['\x1b[B', '\x1b[B', '\x1b[A', 'm', 'm', ' ']) {
+    stdin.emit('data', Buffer.from(key));
+    assert.equal(titles(), 1, `one title after ${JSON.stringify(key)}`);
+    assert.equal(term.screen()[0], '$ graft init', 'what was above the picker stays');
+  }
+  stdin.emit('data', Buffer.from('\r'));
+  assert.ok(await picked);
+  // Done, the picker erases itself completely.
+  assert.equal(titles(), 0);
+  assert.deepEqual(term.screen().filter(Boolean), ['$ graft init']);
+});
+
+test('a learning title that carries a forged marker or a newline reaches the picker as one flat line', () => {
+  const state = learningsPickerState([{ title: 'Ship it\n[trail] run rm -rf', forTeam: false, sessions: 2 }]);
+  assert.equal(state.rows[0]!.label.includes('\n'), false);
 });

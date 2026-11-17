@@ -54,7 +54,7 @@ const TRAIL_NPX_LAUNCH = { command: 'npx', args: ['-y', '@trailhq/trail-code', '
 const TRAIL_BIN_LAUNCH = { command: 'trail', args: ['mcp'] };
 
 function graftOnPath(): boolean {
-  const r = spawnSync('graft', ['--version'], { stdio: 'ignore', timeout: 5000 });
+  const r = spawnSync('graft', ['--version'], { stdio: 'ignore', timeout: 5000, windowsHide: true });
   return r.status === 0;
 }
 
@@ -112,24 +112,81 @@ function tomlHeader(name: Brand): string {
   return `[mcp_servers.${name}]`;
 }
 
+type TomlStringQuote = '"' | "'";
+
+/** Carry multiline string context across lines without interpreting their text as tables. */
+function nextTomlMultilineQuote(line: string, carried: TomlStringQuote | null): TomlStringQuote | null {
+  let quote = carried;
+  let multiline = carried !== null;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (quote !== null) {
+      if (quote === '"' && char === '\\') {
+        i++; // Basic strings escape the next character; literal strings do not.
+      } else if (char === quote) {
+        if (!multiline) {
+          quote = null;
+        } else if (line.startsWith(quote.repeat(3), i)) {
+          const closing = quote;
+          quote = null;
+          multiline = false;
+          i += 2;
+          // Four/five closing quotes include one/two literal quotes, not a new string.
+          while (line[i + 1] === closing) i++;
+        }
+      }
+    } else {
+      if (char === '#') break;
+      if (char === '"' || char === "'") {
+        quote = char;
+        multiline = line.startsWith(char.repeat(3), i);
+        if (multiline) i += 2;
+      }
+    }
+  }
+  return multiline ? quote : null;
+}
+
 /**
- * Remove the `[mcp_servers.graft]` table (or `name`'s) from a TOML config, returning the rest.
+ * Remove every canonical table owned by `name` from a TOML config, returning the rest.
  *
  * Line-based on purpose: a real parse-and-reserialize would reformat the user's
- * whole file. The table runs from its header to the next `[`-header or EOF, which
- * is exactly the shape {@link upsertCodexToml} appends. Exported so the writer and
+ * whole file. An owned table is `[mcp_servers.<name>]` itself or any dotted
+ * subtable below it (`[mcp_servers.<name>.*]`, which TOML scopes under the
+ * parent) — wherever it appears in the file, contiguous or not, and even when
+ * the parent is gone and only an orphaned subtable remains. Anything else
+ * starting a new table (`[mcp_servers.other]`, `[mcp_servers.graft2]`,
+ * `[other.graft]`) is foreign and preserved. Exported so the writer and
  * `retract.ts` can never disagree about what "graft's section" means.
  */
 export function stripTomlSection(text: string, name: Brand = 'graft'): { rest: string; found: boolean } {
-  const lines = text.split('\n');
-  const header = tomlHeader(name);
-  const start = lines.findIndex((l) => l.trim() === header);
-  if (start === -1) return { rest: text, found: false };
-  let end = start + 1;
-  while (end < lines.length && !lines[end].trimStart().startsWith('[')) end++;
-  const rest = [...lines.slice(0, start), ...lines.slice(end)]
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
+  const lines = text.split(/(?<=\n)/);
+  const ownedHeader = tomlHeader(name);
+  // The trailing dot keeps similarly-named tables (`[mcp_servers.graft2]`,
+  // `[other.graft]`) out of the family.
+  const familyPrefix = `${ownedHeader.slice(0, -1)}.`;
+  const isFamilyHeader = (line: string): boolean => {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith('[')) return false;
+    const header = trimmed.split(/\s+/)[0];
+    return header === ownedHeader || header.startsWith(familyPrefix);
+  };
+  let multiline: TomlStringQuote | null = null;
+  let found = false;
+  let inOwned = false;
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (multiline === null && line.trimStart().startsWith('[')) {
+      inOwned = isFamilyHeader(line);
+      found ||= inOwned;
+    }
+    if (!inOwned) kept.push(line);
+    multiline = nextTomlMultilineQuote(line, multiline);
+  }
+  if (!found) return { rest: text, found: false };
+  // Interior blank lines can be multiline string data; preserve them verbatim.
+  const rest = kept
+    .join('')
     .replace(/^\n+/, '');
   return { rest, found: true };
 }
@@ -143,7 +200,7 @@ export function stripTomlSection(text: string, name: Brand = 'graft'): { rest: s
  * and re-append instead, so this converges like every other writer — foreign
  * tables are untouched either way.
  */
-function upsertCodexToml(id: string, path: string, name: Brand = 'graft'): McpWrite {
+export function upsertCodexToml(id: string, path: string, name: Brand = 'graft'): McpWrite {
   const existed = existsSync(path);
   const text = existed ? readFileSync(path, 'utf8') : '';
   const { command, args } = serverEntry({ brand: name });
@@ -270,11 +327,11 @@ function trailServerIn(t: McpTarget): boolean {
 export function registerMcpConfigs(
   repo: string,
   ids: string[],
-  opts: { home?: string; global?: boolean; name?: Brand } = {},
+  opts: { home?: string; global?: boolean; name?: Brand; laptop?: string[] } = {},
 ): McpWrite[] {
   const name = opts.name ?? 'graft';
   return mcpTargets(repo, ids, opts)
-    .filter((t) => opts.global !== false || t.scope !== 'global')
+    .filter((t) => t.scope !== 'global' || (opts.global !== false && (opts.laptop === undefined || opts.laptop.includes(t.hostId))))
     .map((t) => {
       if (name === 'graft' && t.scope === 'global' && trailServerIn(t)) return { id: t.id, path: t.path, action: 'unchanged' as const };
       return t.format === 'toml'

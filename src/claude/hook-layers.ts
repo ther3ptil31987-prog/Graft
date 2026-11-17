@@ -12,6 +12,11 @@
  * looks for `@nanonets/graft` alone, and standing down for it would leave a
  * trail-only machine with no hooks at all. The next session start rewrites it.
  *
+ * Who sent the payload decides first. Claude Code runs both copies, and so
+ * does Cursor (it loads ~/.claude/settings.json beside the repo's). Copilot
+ * CLI reads only the repo's settings, so under it, and under any payload no
+ * host claims, the repo copy answers: twice is better than never.
+ *
  * Reads two small files and imports nothing heavier than node:fs, since every
  * hook loads it.
  */
@@ -19,18 +24,29 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { PACKAGE_FOR } from "../brand.js";
+import { detectHost, type Host } from "../trace/host.js";
 
-/** `node "<shim>" <event>`, the form hosts/claude-global.ts writes. */
-const COMMAND = /^node\s+"([^"]+)"\s+(\S+)$/;
+/** Hosts that run the ~/.claude copy as well as the repo's. */
+const RUNS_GLOBAL_COPY: ReadonlySet<Host> = new Set<Host>(["claude", "cursor"]);
+
+/** `node "<shim>" <event>`, the form hosts/claude-global.ts writes, with the
+ * `|| exit 0` PreToolUse carries (settings-merge.ts failOpen). */
+const COMMAND = /^node\s+"([^"]+)"\s+(\S+)(?:\s+\|\|\s+exit\s+0)?$/;
 
 /**
  * True when this hook process runs from the repo's shim and the `~/.claude`
  * copy also answers `event`, so this one should do nothing.
  *
- * `shim` is the path the hook was started from (`process.argv[1]`).
+ * `shim` is the path the hook was started from (`process.argv[1]`). `payload`
+ * is the hook's stdin, when the caller has it: a host that doesn't run the
+ * ~/.claude copy never stands down.
  */
-export function globalCopyCovers(event: string, shim: string | undefined, home: string = homedir()): boolean {
+export function globalCopyCovers(event: string, shim: string | undefined, home: string = homedir(), env: NodeJS.ProcessEnv = process.env, payload?: unknown): boolean {
   if (!shim) return false;
+  if (payload !== undefined && !RUNS_GLOBAL_COPY.has(detectHost(payload).host)) return false;
+  // Claude Code reads its user settings from CLAUDE_CONFIG_DIR when that is
+  // set, and then never runs the ~/.claude copy: this one has to answer.
+  if (env.CLAUDE_CONFIG_DIR && resolve(env.CLAUDE_CONFIG_DIR) !== resolve(home, ".claude")) return false;
   const at = resolve(dirname(shim));
   // Only Claude Code's repo copy, in `.claude/helpers/` or trail's `.trail/`:
   // Cursor's and Codex's shims call the same entry, and Claude's ~/.claude

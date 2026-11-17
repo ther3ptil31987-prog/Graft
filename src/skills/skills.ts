@@ -8,28 +8,44 @@
  * skill stays one readable page instead of a pile of corrections.
  *
  * The SKILL.md lives in one of two places. A skill the repo already has, in
- * `.claude/skills/<name>/`, is the team's: takeaways attach to it and fold
- * into it, and the diff goes through review like any change. A skill started
- * by `trail learn` lives next to its takeaways in `~/.trail` until someone
+ * `.claude/skills/<name>/`, is the repo's: takeaways attach to it, and fold
+ * into it only when it is Trail's (skill-file.ts), never into one someone
+ * wrote by hand; the diff goes through review like any change. A skill started
+ * by `learn()` lives next to its takeaways in `~/.trail` until someone
  * chooses to share it: `trail skills publish` moves it into the repo's
  * `.claude/skills/`, where Claude Code loads it for everyone who pulls.
+ * (No command calls `learn()` any more: the hidden `trail learn` is gone.)
  *
  * Takeaways are never deleted: a folded one keeps its file, with `folded_in`
  * saying which version took it, so why a rule exists stays findable.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
+import { dirname, join } from "node:path";
 import { matter, type FrontMatterFile } from "../util/front-matter.js";
 import { shortDate, slug } from "../notes/notes.js";
-import { ensureRepoHome, repoPlace } from "../notes/home.js";
+import { ensureRepoHome, repoPlace, trailHome } from "../notes/home.js";
+import { versionOf } from "./front-version.js";
+import { nearestThere, rewriteSkill, skillMark, trailOwned, within } from "./skill-file.js";
 
 /** Trail's and graft's own skills, rewritten by every `init`: never a place for takeaways. */
-const OWN_SKILLS = new Set(["trail", "graft"]);
+export const OWN_SKILLS = new Set(["trail", "graft"]);
 
-/** Where a repo's skills are: the team's in the repo, and this machine's in ~/.trail. */
-export function skillDirs(dir: string): { repo: string; home: string } {
+/**
+ * Where a repo's skills are: the repo's in its `.claude/skills/`, and this
+ * machine's in ~/.trail. A link in either is followed only while it stays
+ * inside its root (`repoRoot`, the checkout; `homeRoot`, ~/.trail), so no
+ * skill file outside the repo or ~/.trail is ever read or written.
+ */
+export function skillDirs(dir: string): SkillDirs {
   const place = repoPlace(dir);
-  return { repo: join(place.checkout, ".claude", "skills"), home: join(place.dir, "skills") };
+  return { repo: join(place.checkout, ".claude", "skills"), home: join(place.dir, "skills"), repoRoot: place.checkout, homeRoot: trailHome() };
+}
+
+export interface SkillDirs {
+  repo: string;
+  home: string;
+  repoRoot: string;
+  homeRoot: string;
 }
 
 export interface Takeaway {
@@ -58,12 +74,21 @@ export interface Skill {
   where: "repo" | "home";
   /** Absolute path of its SKILL.md. */
   file: string;
+  /** Trail may rewrite its SKILL.md (skill-file.ts): never when someone wrote it by hand. */
+  trailOwned: boolean;
   takeaways: Takeaway[];
 }
 
-/** A skill name as a folder: `PDF coords` → `pdf-coords`. */
+/** The longest skill name the Agent Skills spec allows (validate.ts). */
+const NAME_MAX = 64;
+
+/** A skill name as a folder: `PDF coords` → `pdf-coords`. At most 64 characters, cut at a word. */
 export function skillName(raw: string): string {
-  return slug(raw, 8);
+  const name = slug(raw, 8);
+  if (name.length <= NAME_MAX) return name;
+  const cut = name.slice(0, NAME_MAX + 1);
+  const at = cut.lastIndexOf("-");
+  return at > 0 ? cut.slice(0, at) : name.slice(0, NAME_MAX);
 }
 
 function yamlScalar(s: string): string {
@@ -110,16 +135,18 @@ export function renderTakeaway(t: Omit<Takeaway, "path">): string {
   return `${fm.join("\n")}\n${t.text.trim()}\n`;
 }
 
-function readTakeaways(homeSkills: string, name: string): Takeaway[] {
-  const tdir = join(homeSkills, name, "takeaways");
+function readTakeaways(dirs: SkillDirs, name: string): Takeaway[] {
+  const tdir = join(dirs.home, name, "takeaways");
   let files: string[] = [];
   try {
+    if (!within(tdir, dirs.homeRoot)) return [];
     files = readdirSync(tdir).filter((f) => f.endsWith(".md")).sort();
   } catch {
     return [];
   }
   const out: Takeaway[] = [];
   for (const f of files) {
+    if (!within(join(tdir, f), dirs.homeRoot)) continue;
     try {
       const t = parseTakeaway(readFileSync(join(tdir, f), "utf8"), join(tdir, f), name);
       if (t) out.push(t);
@@ -130,22 +157,24 @@ function readTakeaways(homeSkills: string, name: string): Takeaway[] {
   return out;
 }
 
-/** The skill's SKILL.md: the repo's when it has one, else this machine's. */
-function skillFile(dirs: { repo: string; home: string }, name: string): { file: string; where: Skill["where"] } | null {
+/** The skill's SKILL.md: the repo's when it has one, else this machine's. Never one a link leads to outside the repo or ~/.trail. */
+function skillFile(dirs: SkillDirs, name: string): { file: string; where: Skill["where"] } | null {
   const repo = join(dirs.repo, name, "SKILL.md");
-  if (existsSync(repo)) return { file: repo, where: "repo" };
+  if (existsSync(repo) && within(repo, dirs.repoRoot)) return { file: repo, where: "repo" };
   const home = join(dirs.home, name, "SKILL.md");
-  if (existsSync(home)) return { file: home, where: "home" };
+  if (existsSync(home) && within(home, dirs.homeRoot)) return { file: home, where: "home" };
   return null;
 }
 
-function readSkill(dirs: { repo: string; home: string }, name: string): Skill | null {
-  if (OWN_SKILLS.has(name)) return null;
+function readSkill(dirs: SkillDirs, name: string): Skill | null {
+  if (!name || OWN_SKILLS.has(name)) return null;
   const at = skillFile(dirs, name);
   if (!at) return null;
+  let text: string;
   let parsed: FrontMatterFile;
   try {
-    parsed = matter(readFileSync(at.file, "utf8"));
+    text = readFileSync(at.file, "utf8");
+    parsed = matter(text);
   } catch {
     return null;
   }
@@ -153,28 +182,52 @@ function readSkill(dirs: { repo: string; home: string }, name: string): Skill | 
   return {
     name,
     description: typeof d.description === "string" ? d.description.trim() : "",
-    version: typeof d.version === "number" ? d.version : 1,
+    version: versionOf(d),
     body: parsed.content.trim(),
     where: at.where,
     file: at.file,
-    takeaways: readTakeaways(dirs.home, name),
+    trailOwned: trailOwned(text, d, at.where),
+    takeaways: readTakeaways(dirs, name),
   };
 }
 
-function subdirs(dir: string): string[] {
+/**
+ * The folders in `dir`, by name, following links: a repo's skill can sit in
+ * `.agents/skills/<name>/` with `.claude/skills/<name>` linking to it. A link
+ * that loops, dangles, reaches a file or leads out of `root` is skipped, and
+ * two names for one folder count once, the first by name.
+ */
+function subdirs(dir: string, root: string): string[] {
+  let entries: Dirent[];
   try {
-    return readdirSync(dir, { withFileTypes: true })
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name);
+    entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
   } catch {
     return [];
   }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const e of entries) {
+    const path = join(dir, e.name);
+    let real: string;
+    try {
+      if (e.isSymbolicLink() && !statSync(path).isDirectory()) continue;
+      if (!e.isSymbolicLink() && !e.isDirectory()) continue;
+      if (!within(path, root)) continue;
+      real = realpathSync(path);
+    } catch {
+      continue;
+    }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    out.push(e.name);
+  }
+  return out;
 }
 
 /** Every skill for the repo `dir` is in: the team's in the repo, then this machine's, by name. */
 export function listSkills(dir: string): Skill[] {
   const dirs = skillDirs(dir);
-  const names = [...new Set([...subdirs(dirs.repo), ...subdirs(dirs.home)])].sort();
+  const names = [...new Set([...subdirs(dirs.repo, dirs.repoRoot), ...subdirs(dirs.home, dirs.homeRoot)])].sort();
   return names.map((n) => readSkill(dirs, n)).filter((s): s is Skill => s !== null);
 }
 
@@ -196,24 +249,15 @@ export function isConfirmed(t: Takeaway): boolean {
 /* writing                                                                    */
 /* -------------------------------------------------------------------------- */
 
-function renderNewSkill(name: string, description: string): string {
-  const fm = ["---", `name: ${name}`, `description: ${yamlScalar(description)}`, "version: 1", "---"];
-  return `${fm.join("\n")}\n\n# ${name}\n\n${description}.\n`;
-}
-
 /**
- * SKILL.md at a new version with a new body. The frontmatter is edited as
- * text, only its `version:` line, so a team's own skill keeps every other key
- * (`allowed-tools`, `license`, …) exactly as they wrote it.
+ * A new SKILL.md as the Agent Skills spec has it: name and description on
+ * top; Trail's mark and the version under metadata. The description never
+ * holds `---`, which ends the front matter early for the reference validator.
  */
-function rewriteSkill(file: string, version: number, body: string): void {
-  const lines = readFileSync(file, "utf8").split(/\r?\n/);
-  const close = lines[0] === "---" ? lines.indexOf("---", 1) : -1;
-  const fm = close === -1 ? [] : lines.slice(1, close);
-  const at = fm.findIndex((l) => l.startsWith("version:"));
-  if (at === -1) fm.push(`version: ${version}`);
-  else fm[at] = `version: ${version}`;
-  writeFileSync(file, `---\n${fm.join("\n")}\n---\n\n${body.trim()}\n`);
+function renderNewSkill(name: string, description: string): string {
+  const said = description.replace(/-{3,}/g, "--");
+  const fm = ["---", `name: ${name}`, `description: ${JSON.stringify(said)}`, "metadata:", `  trail: ${JSON.stringify(skillMark(name))}`, '  version: "1"', "---"];
+  return `${fm.join("\n")}\n\n# ${name}\n\n${description}.\n`;
 }
 
 export interface LearnInput {
@@ -240,7 +284,7 @@ export interface LearnResult {
 export function learn(dir: string, input: LearnInput): LearnResult {
   const name = skillName(input.skill);
   if (!name) throw new Error("a skill needs a name, like pdf-coords");
-  if (OWN_SKILLS.has(name)) throw new Error(`${name} is the code map's own skill, rewritten by every init — pick a name for what you're teaching, like pdf-coords`);
+  if (OWN_SKILLS.has(name)) throw new Error(`${name} is the code map's own skill, rewritten by every init: pick a name for what you're teaching, like pdf-coords`);
   ensureRepoHome(dir);
   const dirs = skillDirs(dir);
   let created = false;
@@ -306,6 +350,12 @@ export interface FoldResult {
   stillWaiting: number;
   /** The SKILL.md headings that gained lines. */
   sections: string[];
+  /**
+   * Why SKILL.md was left as it is, with takeaways ready: `hand-written`, not
+   * Trail's to rewrite (skill-file.ts); `unreadable`, its front matter isn't
+   * between two `---` lines. The takeaways stay waiting, and still reach the agent.
+   */
+  left?: "hand-written" | "unreadable";
 }
 
 /**
@@ -321,6 +371,8 @@ export function fold(dir: string, name: string, opts: { confirmed?: boolean } = 
   const still = waiting(s).length - ready.length;
   const base = { skill: s.name, where: s.where, file: s.file, from: s.version, stillWaiting: still };
   if (ready.length === 0) return { ...base, to: s.version, folded: [], sections: [] };
+  const leave = (left: FoldResult["left"]): FoldResult => ({ ...base, stillWaiting: waiting(s).length, to: s.version, folded: [], sections: [], left });
+  if (!s.trailOwned) return leave("hand-written");
 
   const lines = s.body.split(/\r?\n/);
   const sections: string[] = [];
@@ -341,7 +393,7 @@ export function fold(dir: string, name: string, opts: { confirmed?: boolean } = 
     if (!sections.includes(heading)) sections.push(heading);
   }
   const to = s.version + 1;
-  rewriteSkill(s.file, to, lines.join("\n"));
+  if (!rewriteSkill(s.file, to, lines.join("\n"), skillMark(s.name))) return leave("unreadable");
   for (const t of ready) {
     t.foldedIn = to;
     writeFileSync(t.path, renderTakeaway(t));
@@ -349,7 +401,8 @@ export function fold(dir: string, name: string, opts: { confirmed?: boolean } = 
   return { ...base, to, folded: ready, sections };
 }
 
-export type PublishResult = { ok: true; file: string } | { ok: false; reason: "unknown" | "in-repo" };
+/** `link`: the repo's `.claude/skills/<name>` leads out of the repo, so nothing is written through it. */
+export type PublishResult = { ok: true; file: string } | { ok: false; reason: "unknown" | "in-repo" | "link" };
 
 /**
  * Move a skill kept on this machine into the repo's `.claude/skills/`, where
@@ -360,8 +413,11 @@ export function publish(dir: string, name: string): PublishResult {
   const s = getSkill(dir, name);
   if (!s) return { ok: false, reason: "unknown" };
   if (s.where === "repo") return { ok: false, reason: "in-repo" };
-  const target = join(skillDirs(dir).repo, s.name, "SKILL.md");
-  mkdirSync(join(target, ".."), { recursive: true });
+  const dirs = skillDirs(dir);
+  const target = join(dirs.repo, s.name, "SKILL.md");
+  // The nearest folder already there must be the repo's own, or the new ones would be made through a link.
+  if (!within(nearestThere(dirname(target)), dirs.repoRoot)) return { ok: false, reason: "link" };
+  mkdirSync(dirname(target), { recursive: true });
   try {
     renameSync(s.file, target);
   } catch {
@@ -392,7 +448,7 @@ export function skillStatus(s: Skill): string {
  */
 export function skillForAgent(s: Skill): string {
   const open = waiting(s).sort((a, b) => b.date.localeCompare(a.date) || b.path.localeCompare(a.path));
-  const out = [`# ${s.name} (v${s.version}, ${s.where === "repo" ? "the team's" : "kept on this machine"})`, "", s.body.trim()];
+  const out = [`# ${s.name} (v${s.version}, ${s.where === "repo" ? "in this repo" : "kept on this machine"})`, "", s.body.trim()];
   if (open.length) {
     out.push("", `## Corrections since v${s.version} (newest first; these win where they disagree with the above)`);
     for (const t of open) out.push(`- ${t.text.replace(/\s*\n\s*/g, " ").trim()} (${[t.taughtBy, shortDate(t.date)].filter(Boolean).join(", ")})`);
@@ -403,16 +459,20 @@ export function skillForAgent(s: Skill): string {
 /**
  * The line a session starts with about skills an agent can't see by itself:
  * ones kept only on this machine (Claude Code loads `.claude/skills/`, not
- * ~/.trail), and the team's ones with corrections waiting. Empty when there
- * are none, so the directive is unchanged everywhere else.
+ * ~/.trail), and the team's ones with corrections waiting. It names the files
+ * to read: `trail skills show` is the learned skills' command now and can't
+ * print these. Empty when there are none.
  */
-export function skillsDirective(dir: string, show: string): string {
+export function skillsDirective(dir: string): string {
   const parts: string[] = [];
+  const dirs = skillDirs(dir);
   for (const s of listSkills(dir)) {
     const open = waiting(s).length;
-    if (s.where === "home") parts.push(`${s.name} (on this machine${open ? `, ${open} correction${open === 1 ? "" : "s"}` : ""})`);
-    else if (open) parts.push(`${s.name} (${open} correction${open === 1 ? "" : "s"} newer than its SKILL.md)`);
+    const fixes = `${open} correction${open === 1 ? "" : "s"}`;
+    const tdir = join(dirs.home, s.name, "takeaways");
+    if (s.where === "home") parts.push(`${s.name} (on this machine: ${s.file}${open ? `, then ${fixes} in ${tdir}` : ""})`);
+    else if (open) parts.push(`${s.name} (${fixes} newer than its SKILL.md, in ${tdir})`);
   }
   if (parts.length === 0) return "";
-  return `Skills with more than Claude Code loads by itself: ${parts.join(", ")}. Before working in one's area, run \`${show} <name>\`: it prints the skill with every correction, newest first.\n`;
+  return `Skills with more than Claude Code loads by itself: ${parts.join(", ")}. Read them before working in one's area, the corrections newest first; they win where they disagree.\n`;
 }
